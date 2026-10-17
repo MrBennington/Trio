@@ -1,17 +1,17 @@
-name: 8. DONT RUN close inactive issues
+name: zzz [DO NOT RUN] Close Inactive Issues
 on:
   schedule:
     - cron: "30 1 * * *"
 
 jobs:
   close-issues:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       issues: write
       pull-requests: write
     if: github.repository_owner == 'nightscout'
     steps:
-      - uses: actions/stale@v9.0.0
+      - uses: actions/stale@v10
         with:
           days-before-issue-stale: 30
           days-before-issue-close: 14
@@ -26,13 +26,13 @@ jobs:
           
 
   close-issues-triage:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       issues: write
       pull-requests: write
     if: github.repository_owner == 'nightscout'
     steps:
-      - uses: actions/stale@v9.0.0
+      - uses: actions/stale@v10
         with:
           days-before-issue-stale: 30
           days-before-issue-close: 30
