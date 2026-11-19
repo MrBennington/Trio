@@ -1,14 +1,17 @@
-name: 8. DONT RUN Add bugs to bugs project
+name: zzz [DO NOT RUN] Add Bugs to Project 'Bugs'
 
+# Called from upstream_automation.yml; see that file for why there is a single dispatcher.
+# Runs when an issue is opened (trigger lives in the caller).
 on:
-  issues:
-    types:
-      - opened
+  workflow_call:
+    secrets:
+      ADD_TO_PROJECT_PAT:
+        required: true
 
 jobs:
   add-to-project:
     name: Add issue to project
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     if: github.repository_owner == 'nightscout'
     steps:
       - uses: actions/add-to-project@v1.0.2

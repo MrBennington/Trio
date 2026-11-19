@@ -1,0 +1,1552 @@
+import Combine
+import CoreData
+import Foundation
+import LoopKit
+import LoopKitUI
+import Swinject
+import UIKit
+
+protocol NightscoutManager: GlucoseSource {
+    func fetchGlucose(since date: Date) async -> [BloodGlucose]
+    func fetchCarbs() async -> [CarbsEntry]
+    func fetchTempTargets() async -> [TempTarget]
+    /// Returns false when Nightscout rejected the delete; unconfigured or upload-disabled Nightscout counts as success.
+    func deleteCarbs(withID id: String) async -> Bool
+    func deleteInsulin(withID id: String) async
+    func deleteGlucose(withID id: String, withDate date: Date) async
+    func uploadCarbs() async
+    func uploadOverrides() async
+    func uploadTempTargets() async
+    func uploadProfiles() async throws
+    @discardableResult func uploadNoteTreatment(note: String) async -> Bool
+    /// Uploads the profile switches and the profile document that have not reached Nightscout yet.
+    func uploadTherapyProfiles() async
+    func importSettings() async -> FetchedNightscoutProfileStore?
+    var cgmURL: URL? { get }
+}
+
+final class BaseNightscoutManager: NightscoutManager, Injectable {
+    @Injected() private var keychain: Keychain!
+    @Injected() private var determinationStorage: DeterminationStorage!
+    @Injected() var glucoseStorage: GlucoseStorage!
+    @Injected() private var tempTargetsStorage: TempTargetsStorage!
+    @Injected() private var overridesStorage: OverrideStorage!
+    @Injected() private var carbsStorage: CarbsStorage!
+    @Injected() private var pumpHistoryStorage: PumpHistoryStorage!
+    @Injected() private var pumpStatusStorage: PumpStatusStorage!
+    @Injected() private var storage: FileStorage!
+    @Injected() private var settingsManager: SettingsManager!
+    @Injected() private var broadcaster: Broadcaster!
+    @Injected() private var reachabilityManager: ReachabilityManager!
+    @Injected() var healthkitManager: HealthKitManager!
+    @Injected() private var bolusCalculationManager: BolusCalculationManager!
+    @Injected() private var apsManager: APSManager!
+    @Injected() private var therapyProfileStorage: TherapyProfileStorage!
+    @Injected() private var deviceDataManager: DeviceDataManager!
+
+    private let processQueue = DispatchQueue(label: "BaseNetworkManager.processQueue")
+    private var ping: TimeInterval?
+
+    /// Coalesces and serializes upload runs so no two runs of the same pipeline overlap.
+    /// Runs execute `performUpload(for:)`, provided at init. The public `upload*()`
+    /// methods and `requestUpload(_:)` go through the serializer; the `performUpload*()`
+    /// bodies must not call the awaitable `upload*()` entry points. The serializer
+    /// asserts on such a call in debug builds and downgrades it to a fire-and-forget
+    /// request in release.
+    private var uploadSerializer: NightscoutUploadSerializer!
+
+    /// Request an upload for a pipeline (enqueue work). Safe to call from anywhere.
+    /// Bursts of requests coalesce: at most one run follows the one currently in flight.
+    func requestUpload(_ uploadPipeline: NightscoutUploadPipeline) {
+        Task(priority: .utility) { [weak self] in
+            await self?.uploadSerializer.request(uploadPipeline)
+        }
+    }
+
+    /// Dispatches to a pipeline's upload routine. Runs inside the serializer; must only
+    /// call `performUpload*()` functions, never the public `upload*()` entry points.
+    private func performUpload(for uploadPipeline: NightscoutUploadPipeline) async {
+        switch uploadPipeline {
+        case .carbs: await performUploadCarbs()
+        case .pumpHistory: await performUploadPumpHistory()
+        case .overrides: await performUploadOverrides()
+        case .tempTargets: await performUploadTempTargets()
+        case .glucose: await performUploadGlucose()
+        case .deviceStatus:
+            do { try await performUploadDeviceStatus() }
+            catch { warning(.nightscout, "Device status upload failed", error: error) }
+        case .profiles: await performUploadTherapyProfiles()
+        }
+    }
+
+    private var isNetworkReachable: Bool {
+        reachabilityManager.isReachable
+    }
+
+    private var isUploadEnabled: Bool {
+        settingsManager.settings.isUploadEnabled
+    }
+
+    private var isDownloadEnabled: Bool {
+        settingsManager.settings.isDownloadEnabled
+    }
+
+    private var isUploadGlucoseEnabled: Bool {
+        settingsManager.settings.uploadGlucose
+    }
+
+    private var nightscoutAPI: NightscoutAPI? {
+        guard let urlString = keychain.getValue(String.self, forKey: NightscoutConfig.Config.urlKey),
+              let url = URL(string: urlString),
+              let secret = keychain.getValue(String.self, forKey: NightscoutConfig.Config.secretKey)
+        else {
+            return nil
+        }
+        return NightscoutAPI(url: url, secret: secret)
+    }
+
+    private var lastEnactedDetermination: Determination?
+    private var lastSuggestedDetermination: Determination?
+
+    /// Bag for Combine subscriptions owned by this manager.
+    var subscriptions = Set<AnyCancellable>()
+
+    let viewContext = CoreDataStack.shared.persistentContainer.viewContext
+
+    // MARK: - Upload triggers
+
+    // Each upload pipeline is driven by an NSFetchedResultsController whose predicate is the
+    // "not yet uploaded to Nightscout" set for that entity. The controller fires whenever
+    // un-uploaded items appear (or drop out after a successful upload), which we map to a
+    // `requestUpload(pipeline)` call (coalesced and serialized per pipeline). Bound to the viewContext,
+    // they also pick up batch-inserted glucose via the persistent history merge in CoreDataStack.
+
+    let determinationUploadControllerDelegate = FetchedResultsControllerDelegate()
+    lazy var determinationUploadController: NSFetchedResultsController<OrefDetermination> = {
+        let request = NSFetchRequest<OrefDetermination>(entityName: "OrefDetermination")
+        request.sortDescriptors = [NSSortDescriptor(keyPath: \OrefDetermination.deliverAt, ascending: true)]
+        request.predicate = NSPredicate(
+            format: "deliverAt >= %@ AND isUploadedToNS == %@",
+            Date.oneDayAgo as NSDate,
+            false as NSNumber
+        )
+        request.fetchBatchSize = 50
+        let controller = NSFetchedResultsController(
+            fetchRequest: request,
+            managedObjectContext: viewContext,
+            sectionNameKeyPath: nil,
+            cacheName: nil
+        )
+        controller.delegate = determinationUploadControllerDelegate
+        return controller
+    }()
+
+    let overrideUploadControllerDelegate = FetchedResultsControllerDelegate()
+    lazy var overrideUploadController: NSFetchedResultsController<OverrideStored> = {
+        let request = NSFetchRequest<OverrideStored>(entityName: "OverrideStored")
+        request.sortDescriptors = [NSSortDescriptor(keyPath: \OverrideStored.date, ascending: true)]
+        request.predicate = NSPredicate(
+            format: "date >= %@ AND isUploadedToNS == %@",
+            Date.oneDayAgo as NSDate,
+            false as NSNumber
+        )
+        let controller = NSFetchedResultsController(
+            fetchRequest: request,
+            managedObjectContext: viewContext,
+            sectionNameKeyPath: nil,
+            cacheName: nil
+        )
+        controller.delegate = overrideUploadControllerDelegate
+        return controller
+    }()
+
+    let overrideRunUploadControllerDelegate = FetchedResultsControllerDelegate()
+    lazy var overrideRunUploadController: NSFetchedResultsController<OverrideRunStored> = {
+        let request = NSFetchRequest<OverrideRunStored>(entityName: "OverrideRunStored")
+        request.sortDescriptors = [NSSortDescriptor(keyPath: \OverrideRunStored.startDate, ascending: true)]
+        request.predicate = NSPredicate(
+            format: "startDate >= %@ AND isUploadedToNS == %@",
+            Date.oneDayAgo as NSDate,
+            false as NSNumber
+        )
+        let controller = NSFetchedResultsController(
+            fetchRequest: request,
+            managedObjectContext: viewContext,
+            sectionNameKeyPath: nil,
+            cacheName: nil
+        )
+        controller.delegate = overrideRunUploadControllerDelegate
+        return controller
+    }()
+
+    let tempTargetUploadControllerDelegate = FetchedResultsControllerDelegate()
+    lazy var tempTargetUploadController: NSFetchedResultsController<TempTargetStored> = {
+        let request = NSFetchRequest<TempTargetStored>(entityName: "TempTargetStored")
+        request.sortDescriptors = [NSSortDescriptor(keyPath: \TempTargetStored.date, ascending: true)]
+        request.predicate = NSPredicate(
+            format: "date >= %@ AND isUploadedToNS == %@",
+            Date.oneDayAgo as NSDate,
+            false as NSNumber
+        )
+        let controller = NSFetchedResultsController(
+            fetchRequest: request,
+            managedObjectContext: viewContext,
+            sectionNameKeyPath: nil,
+            cacheName: nil
+        )
+        controller.delegate = tempTargetUploadControllerDelegate
+        return controller
+    }()
+
+    let tempTargetRunUploadControllerDelegate = FetchedResultsControllerDelegate()
+    lazy var tempTargetRunUploadController: NSFetchedResultsController<TempTargetRunStored> = {
+        let request = NSFetchRequest<TempTargetRunStored>(entityName: "TempTargetRunStored")
+        request.sortDescriptors = [NSSortDescriptor(keyPath: \TempTargetRunStored.startDate, ascending: true)]
+        request.predicate = NSPredicate(
+            format: "startDate >= %@ AND isUploadedToNS == %@",
+            Date.oneDayAgo as NSDate,
+            false as NSNumber
+        )
+        let controller = NSFetchedResultsController(
+            fetchRequest: request,
+            managedObjectContext: viewContext,
+            sectionNameKeyPath: nil,
+            cacheName: nil
+        )
+        controller.delegate = tempTargetRunUploadControllerDelegate
+        return controller
+    }()
+
+    let pumpEventUploadControllerDelegate = FetchedResultsControllerDelegate()
+    lazy var pumpEventUploadController: NSFetchedResultsController<PumpEventStored> = {
+        let request = NSFetchRequest<PumpEventStored>(entityName: "PumpEventStored")
+        request.sortDescriptors = [NSSortDescriptor(keyPath: \PumpEventStored.timestamp, ascending: true)]
+        request.predicate = NSPredicate.pumpEventsNotYetUploadedToNightscout
+        request.fetchBatchSize = 50
+        let controller = NSFetchedResultsController(
+            fetchRequest: request,
+            managedObjectContext: viewContext,
+            sectionNameKeyPath: nil,
+            cacheName: nil
+        )
+        controller.delegate = pumpEventUploadControllerDelegate
+        return controller
+    }()
+
+    let carbEntryUploadControllerDelegate = FetchedResultsControllerDelegate()
+    lazy var carbEntryUploadController: NSFetchedResultsController<CarbEntryStored> = {
+        let request = NSFetchRequest<CarbEntryStored>(entityName: "CarbEntryStored")
+        request.sortDescriptors = [NSSortDescriptor(keyPath: \CarbEntryStored.date, ascending: true)]
+        request.predicate = NSPredicate(
+            format: "date >= %@ AND isUploadedToNS == %@",
+            Date.oneDayAgo as NSDate,
+            false as NSNumber
+        )
+        request.fetchBatchSize = 50
+        let controller = NSFetchedResultsController(
+            fetchRequest: request,
+            managedObjectContext: viewContext,
+            sectionNameKeyPath: nil,
+            cacheName: nil
+        )
+        controller.delegate = carbEntryUploadControllerDelegate
+        return controller
+    }()
+
+    let glucoseUploadControllerDelegate = FetchedResultsControllerDelegate()
+    lazy var glucoseUploadController: NSFetchedResultsController<GlucoseStored> = {
+        let request = NSFetchRequest<GlucoseStored>(entityName: "GlucoseStored")
+        request.sortDescriptors = [NSSortDescriptor(keyPath: \GlucoseStored.date, ascending: true)]
+        request.predicate = NSPredicate.glucoseNotYetUploadedToNightscout
+        request.fetchBatchSize = 50
+        let controller = NSFetchedResultsController(
+            fetchRequest: request,
+            managedObjectContext: viewContext,
+            sectionNameKeyPath: nil,
+            cacheName: nil
+        )
+        controller.delegate = glucoseUploadControllerDelegate
+        return controller
+    }()
+
+    init(resolver: Resolver) {
+        injectServices(resolver)
+
+        uploadSerializer = NightscoutUploadSerializer { [weak self] pipeline in
+            await self?.performUpload(for: pipeline)
+        }
+
+        subscribe()
+
+        setupNotification()
+
+        wireSubscribers()
+
+        /// Ensure that Nightscout Manager holds the `lastEnactedDetermination`, if one exists, on initialization.
+        /// We have to set this here in `init()`, so there's a `lastEnactedDetermination` available after an app restart
+        /// for `performUploadDeviceStatus()`, as within that function `lastEnactedDetermination` is reassigned at the very end of the function.
+        /// This way, we ensure the latest enacted determination is always part of `devicestatus` and avoid having instances
+        /// where the first uploaded non-enacted determination (i.e., "suggested"), lacks the "enacted" data.
+        Task {
+            do {
+                let lastEnactedDeterminationID = try await determinationStorage
+                    .fetchLastDeterminationObjectID(predicate: NSPredicate.enactedDetermination)
+
+                self.lastEnactedDetermination = await determinationStorage
+                    .getOrefDeterminationNotYetUploadedToNightscout(lastEnactedDeterminationID)
+            } catch {
+                warning(.storage, "Failed to fetch last enacted determination", error: error)
+            }
+        }
+    }
+
+    private func subscribe() {
+        _ = reachabilityManager.startListening(onQueue: processQueue) { status in
+            debug(.nightscout, "Network reachability changed: \(status)")
+        }
+    }
+
+    /// Direct upload triggers for App Intents / remote control, which await the upload
+    /// before ending their background task. Uploads are serialized per pipeline, so these
+    /// may fire alongside the Core Data triggers for the same change without double-uploading.
+    func setupNotification() {
+        Foundation.NotificationCenter.default.publisher(for: .willUpdateOverrideConfiguration)
+            .sink { [weak self] _ in
+                guard let self = self else { return }
+                Task {
+                    await self.uploadOverrides()
+
+                    // Post a notification indicating that the upload has finished and that we can end the background task in the OverridePresetsIntentRequest
+                    Foundation.NotificationCenter.default.post(name: .didUpdateOverrideConfiguration, object: nil)
+                }
+            }
+            .store(in: &subscriptions)
+
+        Foundation.NotificationCenter.default.publisher(for: .willUpdateTempTargetConfiguration)
+            .sink { [weak self] _ in
+                guard let self = self else { return }
+                Task {
+                    await self.uploadTempTargets()
+
+                    // Post a notification indicating that the upload has finished and that we can end the background task in the TempTargetPresetsIntentRequest
+                    Foundation.NotificationCenter.default.post(name: .didUpdateTempTargetConfiguration, object: nil)
+                }
+            }
+            .store(in: &subscriptions)
+    }
+
+    func sourceInfo() -> [String: Any]? {
+        if let ping = ping {
+            return [GlucoseSourceKey.nightscoutPing.rawValue: ping]
+        }
+        return nil
+    }
+
+    var cgmURL: URL? {
+        if let url = settingsManager.settings.cgm.appURL {
+            return url
+        }
+
+        let useLocal = settingsManager.settings.useLocalGlucoseSource
+
+        let maybeNightscout = useLocal
+            ? NightscoutAPI(url: URL(string: "http://127.0.0.1:\(settingsManager.settings.localGlucosePort)")!)
+            : nightscoutAPI
+
+        return maybeNightscout?.url
+    }
+
+    func fetchGlucose(since date: Date) async -> [BloodGlucose] {
+        let useLocal = settingsManager.settings.useLocalGlucoseSource
+        ping = nil
+
+        if !useLocal {
+            guard isNetworkReachable else {
+                return []
+            }
+        }
+
+        let maybeNightscout = useLocal
+            ? NightscoutAPI(url: URL(string: "http://127.0.0.1:\(settingsManager.settings.localGlucosePort)")!)
+            : nightscoutAPI
+
+        guard let nightscout = maybeNightscout else {
+            return []
+        }
+
+        let startDate = Date()
+
+        do {
+            let glucose = try await nightscout.fetchLastGlucose(sinceDate: date)
+            if glucose.isNotEmpty {
+                ping = Date().timeIntervalSince(startDate)
+            }
+            return glucose
+        } catch {
+            warning(.nightscout, "Glucose fetch failed", error: error)
+            return []
+        }
+    }
+
+    // MARK: - GlucoseSource
+
+    var glucoseManager: FetchGlucoseManager?
+    var cgmManager: CGMManagerUI?
+
+    let cgmDisplayState = CurrentValueSubject<CgmDisplayState?, Never>(nil)
+    let cgmProgressHighlight = CurrentValueSubject<DeviceLifecycleProgress?, Never>(nil)
+
+    func fetch(_: DispatchTimer?) -> AnyPublisher<[BloodGlucose], Never> {
+        Future { promise in
+            Task {
+                let glucoseData = await self.fetchGlucose(since: self.glucoseStorage.syncDate())
+                promise(.success(glucoseData))
+            }
+        }
+        .eraseToAnyPublisher()
+    }
+
+    func fetchIfNeeded() -> AnyPublisher<[BloodGlucose], Never> {
+        fetch(nil)
+    }
+
+    func fetchCarbs() async -> [CarbsEntry] {
+        guard let nightscout = nightscoutAPI, isNetworkReachable, isDownloadEnabled else {
+            return []
+        }
+
+        let since = carbsStorage.syncDate()
+        do {
+            let carbs = try await nightscout.fetchCarbs(sinceDate: since)
+            return carbs
+        } catch {
+            warning(.nightscout, "Carbs fetch failed", error: error)
+            return []
+        }
+    }
+
+    func fetchTempTargets() async -> [TempTarget] {
+        guard let nightscout = nightscoutAPI, isNetworkReachable, isDownloadEnabled else {
+            return []
+        }
+
+        let since = tempTargetsStorage.syncDate()
+        do {
+            let tempTargets = try await nightscout.fetchTempTargets(sinceDate: since)
+            return tempTargets
+        } catch {
+            warning(.nightscout, "Temp targets fetch failed", error: error)
+            return []
+        }
+    }
+
+    func deleteCarbs(withID id: String) async -> Bool {
+        guard let nightscout = nightscoutAPI, isUploadEnabled else { return true }
+
+        do {
+            try await nightscout.deleteCarbs(withId: id)
+            debug(.nightscout, "Carb entry deleted")
+            return true
+        } catch {
+            warning(.nightscout, "Carb entry deletion failed", error: error)
+            return false
+        }
+    }
+
+    func deleteInsulin(withID id: String) async {
+        guard let nightscout = nightscoutAPI, isUploadEnabled else { return }
+
+        do {
+            try await nightscout.deleteInsulin(withId: id)
+            debug(.nightscout, "Insulin entry deleted")
+        } catch {
+            warning(.nightscout, "Insulin entry deletion failed", error: error)
+        }
+    }
+
+    func deleteGlucose(withID id: String, withDate date: Date) async {
+        guard let nightscout = nightscoutAPI, isUploadEnabled else { return }
+
+        do {
+            try await nightscout.deleteGlucose(withId: id, withDate: date)
+            debug(.nightscout, "Glucose entry deleted")
+        } catch {
+            warning(.nightscout, "Glucose entry deletion failed", error: error)
+        }
+    }
+
+    private func fetchBattery() async -> Battery {
+        let context = CoreDataStack.shared.newTaskContext()
+        context.name = "fetchBattery"
+        return await context.perform {
+            do {
+                let results = try context.fetch(OpenAPS_Battery.fetch(NSPredicate.predicateFor30MinAgo))
+                if let last = results.first {
+                    let percent: Int? = Int(last.percent)
+                    let voltage: Decimal? = last.voltage as Decimal?
+                    let status: String? = last.status
+                    let display: Bool? = last.display
+
+                    if let status {
+                        return Battery(
+                            percent: percent,
+                            voltage: voltage,
+                            string: BatteryState(rawValue: status) ?? BatteryState.unknown,
+                            display: display
+                        )
+                    }
+                }
+                debug(.storage, "No pump battery data from the last 30 min")
+                return Battery(percent: nil, voltage: nil, string: BatteryState.error, display: nil)
+            } catch {
+                warning(.storage, "Pump battery fetch failed", error: error)
+                return Battery(percent: nil, voltage: nil, string: BatteryState.error, display: nil)
+            }
+        }
+    }
+
+    /// The pump status at upload time, read from the pump manager, or the last stored status without one.
+    private func pumpStatusForUpload() async -> PumpStatus? {
+        guard let liveStatus = apsManager.pumpManager?.status else {
+            return await pumpStatusStorage.lastPumpStatus()
+        }
+        let deliveryState = PumpStatusStored.DeliveryState(liveStatus.basalDeliveryState)
+        let pumpStatus = PumpStatus(deliveryState: deliveryState, bolusing: liveStatus.bolusState != .noBolus, timestamp: Date())
+        // The suspend lookback applies to delivery active since a real date.
+        guard deliveryState == .active, case let .active(deliveryActiveSince) = liveStatus.basalDeliveryState else {
+            return pumpStatus
+        }
+
+        let context = CoreDataStack.shared.newTaskContext()
+        context.name = "pumpStatusForUpload"
+        let eventTypes: [PumpEventStored.EventType] = [.pumpSuspend, .pumpResume, .tempBasal, .bolus]
+        let predicate = NSPredicate(
+            format: "timestamp >= %@ AND type IN %@ AND \(NSPredicate.notScheduledBasal) AND (bolus == nil OR bolus.isExternal == NO)",
+            Date.oneDayAgo as NSDate,
+            eventTypes.map(\.rawValue)
+        )
+        let lastEvent: (type: String, date: Date)? = await context.perform {
+            do {
+                let request = PumpEventStored.fetch(predicate, ascending: false, fetchLimit: 1)
+                guard let event = try context.fetch(request).first, let type = event.type, let date = event.timestamp
+                else { return nil }
+                return (type, date)
+            } catch {
+                warning(.storage, "Pump event fetch for the upload status failed", error: error)
+                return nil
+            }
+        }
+
+        return pumpStatus.includingSuspend(deliveryActiveSince: deliveryActiveSince, lastPumpEvent: lastEvent)
+    }
+
+    /// Asynchronously uploads the current status to Nightscout, including OpenAPS status, pump status, and uploader details.
+    ///
+    /// This function gathers and processes various pieces of information such as the "enacted" and "suggested" determinations,
+    /// pump battery and reservoir levels, insulin-on-board (IOB), and the uploader's battery status. It ensures that only
+    /// valid determinations are uploaded by filtering out duplicates and handling unit conversions based on the user's
+    /// settings. If the status upload is successful, it updates the determination storage to mark them as uploaded.
+    ///
+    /// Key steps:
+    /// - Fetch the last unuploaded enacted and suggested determinations from the storage.
+    /// - Retrieve pump-related data such as battery, reservoir, and status.
+    /// - Parse determinations to ensure they are properly formatted for Nightscout, including unit conversions if needed.
+    /// - Construct an `OpenAPSStatus` object with relevant information for upload.
+    /// - Construct a `NightscoutStatus` object with all gathered data.
+    /// - Attempt to upload the status to Nightscout. On success, update the storage to mark determinations as uploaded.
+    /// - Schedule a task to upload pod age data separately.
+    ///
+    /// - Note: Ensure `nightscoutAPI` is initialized and `isUploadEnabled` is set to `true` before invoking this function.
+    private func performUploadDeviceStatus() async throws {
+        guard let nightscout = nightscoutAPI, isUploadEnabled else {
+            debug(.nightscout, "Device status upload skipped: Nightscout not set up or upload disabled")
+            return
+        }
+
+        let tddContext = CoreDataStack.shared.newTaskContext()
+        tddContext.name = "uploadDeviceStatus.tdd"
+        let results = try await CoreDataStack.shared.fetchEntitiesAsync(
+            ofType: TDDStored.self,
+            onContext: tddContext,
+            predicate: NSPredicate.predicateFor30MinAgo,
+            key: "date",
+            ascending: false,
+            fetchLimit: 1
+        )
+
+        let tdd: Decimal? = await tddContext.perform {
+            (results as? [TDDStored])?.first?.total as? Decimal
+        }
+
+        // Suggested / Enacted
+        async let enactedDeterminationID = determinationStorage
+            .fetchLastDeterminationObjectID(predicate: NSPredicate.enactedDeterminationsNotYetUploadedToNightscout)
+        async let suggestedDeterminationID = determinationStorage
+            .fetchLastDeterminationObjectID(predicate: NSPredicate.suggestedDeterminationsNotYetUploadedToNightscout)
+
+        // OpenAPS Status
+        async let fetchedBattery = fetchBattery()
+        async let fetchedIOBEntry = storage.retrieveAsync(OpenAPS.Monitor.iob, as: [IOBEntry].self)
+        async let fetchedPumpStatus = pumpStatusForUpload()
+
+        var (fetchedEnactedDetermination, fetchedSuggestedDetermination) = try await (
+            determinationStorage.getOrefDeterminationNotYetUploadedToNightscout(enactedDeterminationID),
+            determinationStorage.getOrefDeterminationNotYetUploadedToNightscout(suggestedDeterminationID)
+        )
+
+        // Guard to ensure both determinations are not nil
+        guard fetchedEnactedDetermination != nil || fetchedSuggestedDetermination != nil else {
+            debug(.nightscout, "Device status upload skipped: no new determination")
+            return
+        }
+
+        // Unwrap fetchedSuggestedDetermination and manipulate the timestamp field to ensure deliverAt and timestamp for a suggestion truly match!
+        var modifiedSuggestedDetermination = fetchedSuggestedDetermination
+        if var suggestion = fetchedSuggestedDetermination {
+            suggestion.timestamp = suggestion.deliverAt
+
+            if settingsManager.settings.units == .mmolL {
+                suggestion.reason = parseReasonGlucoseValuesToMmolL(suggestion.reason)
+                // TODO: verify that these parsings are needed for 3rd party apps, e.g., LoopFollow
+                suggestion.current_target = suggestion.current_target?.asMmolL
+                suggestion.minGuardBG = suggestion.minGuardBG?.asMmolL
+                suggestion.minPredBG = suggestion.minPredBG?.asMmolL
+                suggestion.threshold = suggestion.threshold?.asMmolL
+            }
+
+            suggestion.reason = injectTDD(into: suggestion.reason, tdd: tdd)
+            suggestion.tdd = tdd
+
+            // Check whether the last suggestion that was uploaded is the same that is fetched again when we are attempting to upload the enacted determination
+            // Apparently we are too fast; so the flag update is not fast enough to have the predicate filter last suggestion out
+            // If this check is truthy, set suggestion to nil so it's not uploaded again
+            if let lastSuggested = lastSuggestedDetermination, lastSuggested.deliverAt == suggestion.deliverAt {
+                modifiedSuggestedDetermination = nil
+            } else {
+                modifiedSuggestedDetermination = suggestion
+            }
+        }
+
+        if var enacted = fetchedEnactedDetermination {
+            if settingsManager.settings.units == .mmolL {
+                enacted.reason = parseReasonGlucoseValuesToMmolL(enacted.reason)
+                // TODO: verify that these parsings are needed for 3rd party apps, e.g., LoopFollow
+                enacted.current_target = enacted.current_target?.asMmolL
+                enacted.minGuardBG = enacted.minGuardBG?.asMmolL
+                enacted.minPredBG = enacted.minPredBG?.asMmolL
+                enacted.threshold = enacted.threshold?.asMmolL
+            }
+
+            enacted.reason = injectTDD(into: enacted.reason, tdd: tdd)
+            enacted.tdd = tdd
+
+            fetchedEnactedDetermination = enacted
+        }
+
+        // Calculate recommended bolus
+        var recommendedBolus: Decimal = 0
+
+        if let latest = fetchedSuggestedDetermination ?? fetchedEnactedDetermination {
+            let minPredBG = latest.minPredBGFromReason ?? 0
+            let simulatedCOB: Int16? = latest.cob.map { Int16(truncating: NSDecimalNumber(decimal: $0)) }
+
+            let result = await bolusCalculationManager.handleBolusCalculation(
+                carbs: 0,
+                useFattyMealCorrection: false,
+                useSuperBolus: false,
+                lastLoopDate: apsManager.lastLoopDate,
+                minPredBG: minPredBG,
+                simulatedCOB: simulatedCOB,
+                isBackdated: false
+            )
+
+            recommendedBolus = apsManager.roundBolus(amount: result.insulinCalculated)
+        }
+
+        // Bolus increment
+        let bolusIncrement = settingsManager.preferences.bolusIncrement
+
+        // Gather all relevant data for OpenAPS Status
+        let iob = await fetchedIOBEntry
+
+        let suggestedToUpload = modifiedSuggestedDetermination ?? lastSuggestedDetermination
+        let enactedToUpload = fetchedEnactedDetermination ?? lastEnactedDetermination
+
+        let openapsStatus = OpenAPSStatus(
+            iob: iob?.first,
+            suggested: suggestedToUpload,
+            enacted: settingsManager.settings.dosingMode.automation != .off ? enactedToUpload : nil,
+            version: Bundle.main.releaseVersionNumber ?? "Unknown",
+            recommendedBolus: recommendedBolus,
+            dosingMode: settingsManager.settings.dosingMode.rawValue,
+            iobForecast: iob.flatMap { $0.count > 1 ? NightscoutIOBForecast($0) : nil }
+        )
+
+        debug(
+            .nightscout,
+            "Device status ready: enacted \(openapsStatus.enacted != nil), suggested \(openapsStatus.suggested != nil), recommended bolus \(recommendedBolus) U"
+        )
+
+        // Gather all relevant data for NS Status
+        let battery = await fetchedBattery
+        let reservoir = apsManager.pumpManager?.currentReservoir
+        let pumpStatus = await fetchedPumpStatus
+        let pump = NSPumpStatus(
+            clock: Date(),
+            battery: battery,
+            reservoir: reservoir.flatMap { $0 != 0xDEAD_BEEF ? $0 : nil },
+            status: pumpStatus,
+            bolusIncrement: bolusIncrement
+        )
+
+        let batteryLevel = await UIDevice.current.batteryLevel
+        let batteryState = await UIDevice.current.batteryState
+        let uploader = Uploader(
+            batteryVoltage: nil,
+            battery: Int(batteryLevel * 100),
+            isCharging: batteryState == .charging || batteryState == .full
+        )
+        let status = NightscoutStatus(
+            device: NightscoutTreatment.local,
+            openaps: openapsStatus,
+            pump: pump,
+            uploader: uploader
+        )
+
+        do {
+            try await nightscout.uploadDeviceStatus(status)
+            info(.nightscout, "Device status uploaded")
+
+            if let enacted = fetchedEnactedDetermination {
+                await updateOrefDeterminationAsUploaded([enacted])
+                debug(.nightscout, "Enacted determination marked as uploaded")
+            }
+
+            if let suggested = fetchedSuggestedDetermination {
+                await updateOrefDeterminationAsUploaded([suggested])
+                debug(.nightscout, "Suggested determination marked as uploaded")
+            }
+
+            if let lastEnactedDetermination = fetchedEnactedDetermination {
+                self.lastEnactedDetermination = lastEnactedDetermination
+            }
+
+            if let lastSuggestedDetermination = fetchedSuggestedDetermination {
+                self.lastSuggestedDetermination = lastSuggestedDetermination
+            }
+        } catch {
+            warning(.nightscout, "Device status upload failed", error: error)
+        }
+    }
+
+    private func updateOrefDeterminationAsUploaded(_ determination: [Determination]) async {
+        let context = CoreDataStack.shared.newTaskContext()
+        context.name = "updateOrefDeterminationAsUploaded"
+        await context.perform {
+            let ids = determination.map(\.id) as NSArray
+            let fetchRequest: NSFetchRequest<OrefDetermination> = OrefDetermination.fetchRequest()
+            fetchRequest.predicate = NSPredicate(format: "id IN %@", ids)
+
+            do {
+                let results = try context.fetch(fetchRequest)
+                for result in results {
+                    result.isUploadedToNS = true
+                }
+
+                guard context.hasChanges else { return }
+                try context.save()
+            } catch let error as NSError {
+                warning(.storage, "Failed to mark determinations as uploaded to Nightscout", error: error)
+            }
+        }
+    }
+
+    func uploadProfiles() async throws {
+        if isUploadEnabled {
+            do {
+                guard let sensitivities = await storage.retrieveAsync(
+                    OpenAPS.Settings.insulinSensitivities,
+                    as: InsulinSensitivities.self
+                ) else {
+                    warning(.nightscout, "Profile upload skipped: insulin sensitivities could not be loaded")
+                    return
+                }
+                guard let targets = await storage.retrieveAsync(OpenAPS.Settings.bgTargets, as: BGTargets.self) else {
+                    warning(.nightscout, "Profile upload skipped: glucose targets could not be loaded")
+                    return
+                }
+                guard let carbRatios = await storage.retrieveAsync(OpenAPS.Settings.carbRatios, as: CarbRatios.self) else {
+                    warning(.nightscout, "Profile upload skipped: carb ratios could not be loaded")
+                    return
+                }
+                guard let basalProfile = await storage.retrieveAsync(OpenAPS.Settings.basalProfile, as: [BasalProfileEntry].self)
+                else {
+                    warning(.nightscout, "Profile upload skipped: basal profile could not be loaded")
+                    return
+                }
+
+                let units = settingsManager.settings.units
+                let nsUnits: String = {
+                    switch units {
+                    case .mgdL:
+                        return "mg/dl"
+                    case .mmolL:
+                        return "mmol"
+                    }
+                }()
+
+                let storedProfiles = try await therapyProfileStorage.fetchProfiles()
+                let activeProfile = TrioTherapyProfile(
+                    name: storedProfiles.activeProfileName ?? TrioTherapyProfile.defaultName,
+                    basalProfile: basalProfile,
+                    carbRatios: carbRatios,
+                    insulinSensitivities: sensitivities,
+                    bgTargets: targets
+                )
+                let store = ScheduledNightscoutProfile.store(
+                    profiles: storedProfiles.inactiveProfiles + [activeProfile],
+                    units: units,
+                    dia: settingsManager.pumpSettings.insulinActionCurve,
+                    min5mCarbimpact: settingsManager.preferences.min5mCarbimpact,
+                    timezone: TimeZone.current.identifier
+                )
+                let defaultProfile = activeProfile.storeKey
+                let scheduledSwitches = storedProfiles.scheduledSwitches.withStoreKeys
+                let profileEditLimits = NightscoutProfileEditLimits(
+                    units: units,
+                    basalLimits: TherapyBasalLimits(
+                        pumpManager: deviceDataManager.pumpManager,
+                        maxBasal: settingsManager.pumpSettings.maxBasal
+                    )
+                )
+
+                let now = Date()
+
+                let bundleIdentifier = Bundle.main.bundleIdentifier ?? ""
+                let deviceToken = UserDefaults.standard.string(forKey: "deviceToken") ?? ""
+                let isAPNSProduction = UserDefaults.standard.bool(forKey: "isAPNSProduction")
+                let presetOverrides = try await overridesStorage.getPresetOverridesForNightscout()
+                let teamID = Bundle.main.object(forInfoDictionaryKey: "TeamID") as? String ?? ""
+                let expireDate = BuildDetails.shared.calculateExpirationDate()
+                let remoteCommands = TrioRemoteControl.CommandType.supported.map(\.rawValue)
+
+                let profileStore = NightscoutProfileStore(
+                    defaultProfile: defaultProfile,
+                    startDate: now,
+                    mills: Int(now.timeIntervalSince1970) * 1000,
+                    units: nsUnits,
+                    enteredBy: NightscoutTreatment.local,
+                    store: store,
+                    bundleIdentifier: bundleIdentifier,
+                    deviceToken: deviceToken,
+                    isAPNSProduction: isAPNSProduction,
+                    overridePresets: presetOverrides,
+                    teamID: teamID,
+                    expirationDate: expireDate,
+                    remoteCommands: remoteCommands,
+                    profileEditLimits: profileEditLimits,
+                    scheduledSwitches: scheduledSwitches,
+                    scheduledSwitchesFingerprint: scheduledSwitches.fingerprint
+                )
+
+                guard let nightscout = nightscoutAPI, isNetworkReachable else {
+                    if !isNetworkReachable {
+                        debug(.nightscout, "Profile upload skipped: network unreachable")
+                    } else {
+                        debug(.nightscout, "Profile upload skipped: Nightscout not set up")
+                    }
+                    return
+                }
+
+                try await nightscout.uploadProfile(profileStore)
+                try await therapyProfileStorage.markProfilesUploaded(storedProfiles)
+
+                BuildDetails.shared.recordUploadedExpireDate(expireDate: expireDate)
+                BuildDetails.shared.recordUploadedRemoteCommands(remoteCommands)
+
+                info(.nightscout, "Profile uploaded")
+            } catch {
+                warning(.nightscout, "Profile upload failed", error: error)
+                throw error
+            }
+        } else {
+            debug(.nightscout, "Profile upload skipped: upload disabled")
+        }
+    }
+
+    func importSettings() async -> FetchedNightscoutProfileStore? {
+        guard let nightscout = nightscoutAPI else {
+            debug(.nightscout, "Settings import skipped: Nightscout not set up")
+            return nil
+        }
+
+        do {
+            return try await nightscout.importSettings()
+        } catch {
+            warning(.nightscout, "Settings import failed", error: error)
+            return nil
+        }
+    }
+
+    private func performUploadGlucose() async {
+        do {
+            try await uploadGlucose(glucoseStorage.getGlucoseNotYetUploadedToNightscout())
+            try await uploadNonCoreDataTreatments(glucoseStorage.getCGMStateNotYetUploadedToNightscout())
+        } catch {
+            warning(.nightscout, "Failed to load pending glucose for upload", error: error)
+        }
+    }
+
+    private func performUploadPumpHistory() async {
+        do {
+            try await uploadPumpHistory(pumpHistoryStorage.getPumpHistoryNotYetUploadedToNightscout())
+        } catch {
+            warning(.nightscout, "Failed to load pending pump history for upload", error: error)
+        }
+    }
+
+    func uploadCarbs() async {
+        await uploadSerializer.run(.carbs)
+    }
+
+    private func performUploadCarbs() async {
+        do {
+            try await uploadCarbs(carbsStorage.getCarbsNotYetUploadedToNightscout())
+            try await uploadCarbs(carbsStorage.getFPUsNotYetUploadedToNightscout())
+        } catch {
+            warning(.nightscout, "Failed to load pending carbs for upload", error: error)
+        }
+    }
+
+    func uploadOverrides() async {
+        await uploadSerializer.run(.overrides)
+    }
+
+    private func performUploadOverrides() async {
+        do {
+            try await uploadOverrides(overridesStorage.getOverridesNotYetUploadedToNightscout())
+            try await uploadOverrideRuns(overridesStorage.getOverrideRunsNotYetUploadedToNightscout())
+        } catch {
+            warning(.nightscout, "Failed to load pending overrides for upload", error: error)
+        }
+    }
+
+    func uploadTempTargets() async {
+        await uploadSerializer.run(.tempTargets)
+    }
+
+    private func performUploadTempTargets() async {
+        do {
+            try await uploadTempTargets(await tempTargetsStorage.getTempTargetsNotYetUploadedToNightscout())
+            try await uploadTempTargetRuns(await tempTargetsStorage.getTempTargetRunsNotYetUploadedToNightscout())
+        } catch {
+            warning(.nightscout, "Failed to load pending temp targets for upload", error: error)
+        }
+    }
+
+    private func uploadGlucose(_ glucose: [BloodGlucose]) async {
+        guard !glucose.isEmpty, let nightscout = nightscoutAPI, isUploadEnabled, isUploadGlucoseEnabled else {
+            return
+        }
+
+        do {
+            // Upload in Batches of 100
+            for chunk in glucose.chunks(ofCount: 100) {
+                try await nightscout.uploadGlucose(Array(chunk))
+            }
+
+            // If successful, update the isUploadedToNS property of the GlucoseStored objects
+            await updateGlucoseAsUploaded(glucose)
+
+            info(.nightscout, "Uploaded \(glucose.count) glucose values")
+        } catch {
+            warning(.nightscout, "Upload of \(glucose.count) glucose values failed", error: error)
+        }
+    }
+
+    private func updateGlucoseAsUploaded(_ glucose: [BloodGlucose]) async {
+        let context = CoreDataStack.shared.newTaskContext()
+        context.name = "updateGlucoseAsUploaded"
+        await context.perform {
+            let ids = glucose.map(\.id) as NSArray
+            let fetchRequest: NSFetchRequest<GlucoseStored> = GlucoseStored.fetchRequest()
+            fetchRequest.predicate = NSPredicate(format: "id IN %@", ids)
+
+            do {
+                let results = try context.fetch(fetchRequest)
+                for result in results {
+                    result.isUploadedToNS = true
+                }
+
+                guard context.hasChanges else { return }
+                try context.save()
+            } catch let error as NSError {
+                warning(.storage, "Failed to mark glucose as uploaded to Nightscout", error: error)
+            }
+        }
+    }
+
+    /// - Returns: `true` only if every chunk reached Nightscout.
+    @discardableResult private func uploadNonCoreDataTreatments(_ treatments: [NightscoutTreatment]) async -> Bool {
+        guard !treatments.isEmpty, let nightscout = nightscoutAPI, isUploadEnabled else {
+            return false
+        }
+
+        do {
+            for chunk in treatments.chunks(ofCount: 100) {
+                try await nightscout.uploadTreatments(Array(chunk))
+            }
+
+            info(.nightscout, "Uploaded \(treatments.count) treatments")
+            return true
+        } catch {
+            warning(.nightscout, "Upload of \(treatments.count) treatments failed", error: error)
+            return false
+        }
+    }
+
+    private func uploadPumpHistory(_ treatments: [NightscoutTreatment]) async {
+        guard !treatments.isEmpty, let nightscout = nightscoutAPI, isUploadEnabled else {
+            return
+        }
+
+        do {
+            for chunk in treatments.chunks(ofCount: 100) {
+                try await nightscout.uploadTreatments(Array(chunk))
+            }
+
+            await updatePumpEventStoredsAsUploaded(treatments)
+
+            info(.nightscout, "Uploaded \(treatments.count) pump events")
+        } catch {
+            warning(.nightscout, "Upload of \(treatments.count) pump events failed", error: error)
+        }
+    }
+
+    private func updatePumpEventStoredsAsUploaded(_ treatments: [NightscoutTreatment]) async {
+        let context = CoreDataStack.shared.newTaskContext()
+        context.name = "updatePumpEventStoredsAsUploaded"
+        await context.perform {
+            let ids = treatments.map(\.id) as NSArray
+            let treatmentsById = Dictionary(
+                treatments.compactMap { treatment in treatment.id.map { ($0, treatment) } },
+                uniquingKeysWith: { first, _ in first }
+            )
+            let fetchRequest: NSFetchRequest<PumpEventStored> = PumpEventStored.fetchRequest()
+            fetchRequest.predicate = NSPredicate(format: "id IN %@", ids)
+
+            do {
+                let results = try context.fetch(fetchRequest)
+                for result in results {
+                    // stamp only if the row still holds what was sent; a mid-flight
+                    // finalization keeps the flag false and the next pass re-uploads
+                    guard let treatment = result.id.flatMap({ treatmentsById[$0] }),
+                          Self.uploadStillCurrent(result, treatment)
+                    else {
+                        debug(.nightscout, "Pump event \(result.id ?? "-") changed during upload, keeping it queued")
+                        continue
+                    }
+                    result.isUploadedToNS = true
+                }
+
+                guard context.hasChanges else { return }
+                try context.save()
+            } catch let error as NSError {
+                warning(.storage, "Failed to mark pump events as uploaded to Nightscout", error: error)
+            }
+        }
+    }
+
+    /// True when the stored row still matches the values that were sent to NS.
+    static func uploadStillCurrent(_ event: PumpEventStored, _ treatment: NightscoutTreatment) -> Bool {
+        switch event.type {
+        case PumpEventStored.EventType.bolus.rawValue:
+            return treatment.insulin == event.bolus?.amount as Decimal?
+                && (treatment.isProgrammedByPumpUI ?? false) == (event.bolus?.isProgrammedByPumpUI ?? false)
+        case PumpEventStored.EventType.tempBasal.rawValue:
+            return treatment.rate == event.tempBasal?.rate as Decimal?
+                && treatment.duration == Int(event.tempBasal?.duration ?? 0)
+        default:
+            return true
+        }
+    }
+
+    private func uploadCarbs(_ treatments: [NightscoutTreatment]) async {
+        guard !treatments.isEmpty, let nightscout = nightscoutAPI, isUploadEnabled else {
+            return
+        }
+
+        do {
+            for chunk in treatments.chunks(ofCount: 100) {
+                try await nightscout.uploadTreatments(Array(chunk))
+            }
+
+            // If successful, update the isUploadedToNS property of the CarbEntryStored objects
+            await updateCarbsAsUploaded(treatments)
+
+            info(.nightscout, "Uploaded \(treatments.count) carb entries")
+        } catch {
+            warning(.nightscout, "Upload of \(treatments.count) carb entries failed", error: error)
+        }
+    }
+
+    private func updateCarbsAsUploaded(_ treatments: [NightscoutTreatment]) async {
+        let context = CoreDataStack.shared.newTaskContext()
+        context.name = "updateCarbsAsUploaded"
+        await context.perform {
+            let ids = treatments.map(\.id) as NSArray
+            let fetchRequest: NSFetchRequest<CarbEntryStored> = CarbEntryStored.fetchRequest()
+            fetchRequest.predicate = NSPredicate(format: "id IN %@", ids)
+
+            do {
+                let results = try context.fetch(fetchRequest)
+                for result in results {
+                    result.isUploadedToNS = true
+                }
+
+                guard context.hasChanges else { return }
+                try context.save()
+            } catch let error as NSError {
+                warning(.storage, "Failed to mark carb entries as uploaded to Nightscout", error: error)
+            }
+        }
+    }
+
+    private func uploadOverrides(_ overrides: [NightscoutExercise]) async {
+        guard !overrides.isEmpty, let nightscout = nightscoutAPI, isUploadEnabled else {
+            return
+        }
+
+        do {
+            var processedOverrides: [NightscoutExercise] = []
+
+            for override in overrides {
+                guard let createdAtString = override.created_at as? String else {
+                    continue
+                }
+
+                /// Check for an existing stored override and delete if needed
+                /// This is neccessary to delete original entry in NS when a running override gets customized with a new duration.
+                try await overridesStorage.checkIfShouldDeleteNightscoutOverrideEntry(
+                    forCreatedAt: createdAtString,
+                    newDuration: override.duration,
+                    using: nightscout
+                )
+
+                processedOverrides.append(override)
+            }
+
+            for chunk in processedOverrides.chunks(ofCount: 100) {
+                try await nightscout.uploadOverrides(Array(chunk))
+            }
+
+            // If successful, update the isUploadedToNS property of the OverrideStored objects
+            await updateOverridesAsUploaded(processedOverrides)
+
+            info(.nightscout, "Uploaded \(processedOverrides.count) overrides")
+        } catch {
+            warning(.nightscout, "Upload of \(overrides.count) overrides failed", error: error)
+        }
+    }
+
+    private func updateOverridesAsUploaded(_ overrides: [NightscoutExercise]) async {
+        let context = CoreDataStack.shared.newTaskContext()
+        context.name = "updateOverridesAsUploaded"
+        await context.perform {
+            let ids = overrides.map(\.id) as NSArray
+            let fetchRequest: NSFetchRequest<OverrideStored> = OverrideStored.fetchRequest()
+            fetchRequest.predicate = NSPredicate(format: "id IN %@", ids)
+
+            do {
+                let results = try context.fetch(fetchRequest)
+                for result in results {
+                    result.isUploadedToNS = true
+                }
+
+                guard context.hasChanges else { return }
+                try context.save()
+            } catch let error as NSError {
+                warning(.storage, "Failed to mark overrides as uploaded to Nightscout", error: error)
+            }
+        }
+    }
+
+    private func uploadOverrideRuns(_ overrideRuns: [NightscoutExercise]) async {
+        guard !overrideRuns.isEmpty, let nightscout = nightscoutAPI, isUploadEnabled else {
+            return
+        }
+
+        do {
+            var processedOverrideRuns: [NightscoutExercise] = []
+            for overrideRun in overrideRuns {
+                guard let createdAtString = overrideRun.created_at as? String else {
+                    continue
+                }
+
+                /// The entry Nightscout holds for this activation carries the placeholder duration
+                /// uploaded when the override started, under the same `created_at` the run derives
+                /// from its `startDate`. Nightscout re-renders a duration change only when the entry
+                /// is replaced, so the entry is deleted and the run re-posted in its place.
+                try await nightscout.deleteNightscoutOverride(withCreatedAt: createdAtString)
+
+                processedOverrideRuns.append(overrideRun)
+            }
+
+            for chunk in processedOverrideRuns.chunks(ofCount: 100) {
+                try await nightscout.uploadOverrides(Array(chunk))
+            }
+
+            // If successful, update the isUploadedToNS property of the OverrideRunStored objects
+            await updateOverrideRunsAsUploaded(overrideRuns)
+
+            info(.nightscout, "Uploaded \(processedOverrideRuns.count) override runs")
+        } catch {
+            warning(.nightscout, "Upload of \(overrideRuns.count) override runs failed", error: error)
+        }
+    }
+
+    private func updateOverrideRunsAsUploaded(_ overrideRuns: [NightscoutExercise]) async {
+        let context = CoreDataStack.shared.newTaskContext()
+        context.name = "updateOverrideRunsAsUploaded"
+        await context.perform {
+            let ids = overrideRuns.map(\.id) as NSArray
+            let fetchRequest: NSFetchRequest<OverrideRunStored> = OverrideRunStored.fetchRequest()
+            fetchRequest.predicate = NSPredicate(format: "id IN %@", ids)
+
+            do {
+                let results = try context.fetch(fetchRequest)
+                for result in results {
+                    result.isUploadedToNS = true
+                }
+
+                guard context.hasChanges else { return }
+                try context.save()
+            } catch let error as NSError {
+                warning(.storage, "Failed to mark override runs as uploaded to Nightscout", error: error)
+            }
+        }
+    }
+
+    private func uploadTempTargets(_ tempTargets: [NightscoutTreatment]) async {
+        guard !tempTargets.isEmpty, let nightscout = nightscoutAPI, isUploadEnabled else {
+            return
+        }
+
+        do {
+            for chunk in tempTargets.chunks(ofCount: 100) {
+                try await nightscout.uploadTreatments(Array(chunk))
+            }
+
+            // If successful, update the isUploadedToNS property of the TempTargetStored objects
+            await updateTempTargetsAsUploaded(tempTargets)
+
+            info(.nightscout, "Uploaded \(tempTargets.count) temp targets")
+        } catch {
+            warning(.nightscout, "Upload of \(tempTargets.count) temp targets failed", error: error)
+        }
+    }
+
+    private func updateTempTargetsAsUploaded(_ tempTargets: [NightscoutTreatment]) async {
+        let context = CoreDataStack.shared.newTaskContext()
+        context.name = "updateTempTargetsAsUploaded"
+        await context.perform {
+            let ids = tempTargets.map(\.id) as NSArray
+            let fetchRequest: NSFetchRequest<TempTargetStored> = TempTargetStored.fetchRequest()
+            fetchRequest.predicate = NSPredicate(format: "id IN %@", ids)
+
+            do {
+                let results = try context.fetch(fetchRequest)
+                for result in results {
+                    result.isUploadedToNS = true
+                }
+
+                guard context.hasChanges else { return }
+                try context.save()
+            } catch let error as NSError {
+                warning(.storage, "Failed to mark temp targets as uploaded to Nightscout", error: error)
+            }
+        }
+    }
+
+    private func uploadTempTargetRuns(_ tempTargetRuns: [NightscoutTreatment]) async {
+        guard !tempTargetRuns.isEmpty, let nightscout = nightscoutAPI, isUploadEnabled else {
+            return
+        }
+
+        do {
+            for chunk in tempTargetRuns.chunks(ofCount: 100) {
+                try await nightscout.uploadTreatments(Array(chunk))
+            }
+
+            // If successful, update the isUploadedToNS property of the TempTargetRunStored objects
+            await updateTempTargetRunsAsUploaded(tempTargetRuns)
+
+            info(.nightscout, "Uploaded \(tempTargetRuns.count) temp target runs")
+        } catch {
+            warning(.nightscout, "Upload of \(tempTargetRuns.count) temp target runs failed", error: error)
+        }
+    }
+
+    private func updateTempTargetRunsAsUploaded(_ tempTargetRuns: [NightscoutTreatment]) async {
+        let context = CoreDataStack.shared.newTaskContext()
+        context.name = "updateTempTargetRunsAsUploaded"
+        await context.perform {
+            let ids = tempTargetRuns.map(\.id) as NSArray
+            let fetchRequest: NSFetchRequest<TempTargetRunStored> = TempTargetRunStored.fetchRequest()
+            fetchRequest.predicate = NSPredicate(format: "id IN %@", ids)
+
+            do {
+                let results = try context.fetch(fetchRequest)
+                for result in results {
+                    result.isUploadedToNS = true
+                }
+
+                guard context.hasChanges else { return }
+                try context.save()
+            } catch let error as NSError {
+                warning(.storage, "Failed to mark temp target runs as uploaded to Nightscout", error: error)
+            }
+        }
+    }
+
+    // TODO: have this checked; this has never actually written anything to file; the entire logic of this function seems broken
+    @discardableResult func uploadNoteTreatment(note: String) async -> Bool {
+        let uploadedNotes = storage.retrieve(OpenAPS.Nightscout.uploadedNotes, as: [NightscoutTreatment].self) ?? []
+        let now = Date()
+
+        if uploadedNotes.last?.notes != note || (uploadedNotes.last?.createdAt ?? .distantPast) != now {
+            let noteTreatment = NightscoutTreatment(
+                eventType: .nsNote,
+                createdAt: now,
+                enteredBy: NightscoutTreatment.local,
+                notes: note,
+                targetTop: nil,
+                targetBottom: nil
+            )
+            return await uploadNonCoreDataTreatments([noteTreatment])
+            // TODO: fix/adjust, if necessary
+//            await uploadTreatments([noteTreatment], fileToSave: OpenAPS.Nightscout.uploadedNotes)
+        }
+        return false
+    }
+
+    func uploadTherapyProfiles() async {
+        await uploadSerializer.run(.profiles)
+    }
+
+    private func performUploadTherapyProfiles() async {
+        do {
+            for profileSwitch in try await therapyProfileStorage.profileSwitchesNotYetUploaded() {
+                let profileName = profileSwitch.name == TrioTherapyProfile.defaultName
+                    ? TrioTherapyProfile.defaultStoreKey : profileSwitch.name
+                let treatment = NightscoutTreatment(
+                    duration: 0,
+                    eventType: .nsProfileSwitch,
+                    createdAt: profileSwitch.date,
+                    enteredBy: NightscoutTreatment.local,
+                    notes: profileSwitch.trigger?.nightscoutNote,
+                    targetTop: nil,
+                    targetBottom: nil,
+                    profile: profileName
+                )
+                guard await uploadNonCoreDataTreatments([treatment]) else { return }
+                try await therapyProfileStorage.markSwitchUploaded(profileSwitch)
+                info(.nightscout, "Profile switch of \(profileSwitch.date) uploaded")
+            }
+            if try await therapyProfileStorage.profilesNotYetUploaded() {
+                try await uploadProfiles()
+            }
+        } catch {
+            warning(.nightscout, "Therapy profile upload failed", error: error)
+        }
+    }
+}
+
+extension Array {
+    func chunks(ofCount count: Int) -> [[Element]] {
+        stride(from: 0, to: self.count, by: count).map {
+            Array(self[$0 ..< Swift.min($0 + count, self.count)])
+        }
+    }
+}
+
+extension BaseNightscoutManager {
+    /**
+     Converts glucose-related values in the given `reason` string to mmol/L, including ranges (e.g., `ISF: 54→54`), comparisons (e.g., `maxDelta 37 > 20% of BG 95`), and both positive and negative values (e.g., `Dev: -36`).
+
+     - Parameters:
+       - reason: The string containing glucose-related values to be converted.
+
+     - Returns:
+       A string with glucose values converted to mmol/L.
+
+     - Glucose tags handled: `ISF:`, `Target:`, `minPredBG`, `minGuardBG`, `IOBpredBG`, `COBpredBG`, `UAMpredBG`, `Dev:`, `maxDelta`, `BGI`.
+     */
+
+    // TODO: Consolidate all mmol parsing methods (in TagCloudView, NightscoutManager and HomeRootView) to one central func
+    func parseReasonGlucoseValuesToMmolL(_ reason: String) -> String {
+        let patterns = [
+            "(?:ISF|Target):\\s*-?\\d+\\.?\\d*(?:→-?\\d+\\.?\\d*)+",
+            // ISF or Target with any number of “→value” segments after the first number
+            "Dev:\\s*-?\\d+\\.?\\d*", // Dev pattern
+            "BGI:\\s*-?\\d+\\.?\\d*", // BGI pattern
+            "Target:\\s*-?\\d+\\.?\\d*", // Target pattern
+            "(?:minPredBG|minGuardBG|IOBpredBG|COBpredBG|UAMpredBG)\\s+-?\\d+\\.?\\d*(?:<-?\\d+\\.?\\d*)?", // minPredBG, etc.
+            "minGuardBG\\s+-?\\d+\\.?\\d*<-?\\d+\\.?\\d*", // minGuardBG x<y
+            "Eventual BG\\s+-?\\d+\\.?\\d*\\s*>=\\s*-?\\d+\\.?\\d*", // Eventual BG x >= target
+            "Eventual BG\\s+-?\\d+\\.?\\d*\\s*<\\s*-?\\d+\\.?\\d*", // Eventual BG x < target
+            "\\S+\\s+\\d+\\s*>\\s*\\d+%\\s+of\\s+BG\\s+\\d+" // maxDelta x > y% of BG z
+        ]
+        let pattern = patterns.joined(separator: "|")
+        let regex = try! NSRegularExpression(pattern: pattern)
+
+        func convertToMmolL(_ value: String) -> String {
+            if let glucoseValue = Double(value.replacingOccurrences(of: "[^\\d.-]", with: "", options: .regularExpression)) {
+                let mmolValue = Decimal(glucoseValue).asMmolL
+                return mmolValue.description
+            }
+            return value
+        }
+
+        let matches = regex.matches(in: reason, range: NSRange(reason.startIndex..., in: reason))
+        var updatedReason = reason
+
+        for match in matches.reversed() {
+            guard let range = Range(match.range, in: reason) else { continue }
+            let glucoseValueString = String(reason[range])
+
+            if glucoseValueString.contains("→") {
+                // Handle ISF: X→Y… or Target: X→Y→Z…
+                let parts = glucoseValueString.components(separatedBy: ":")
+                guard parts.count == 2 else { continue }
+                let targetOrISF = parts[0].trimmingCharacters(in: .whitespaces)
+                let values = parts[1]
+                    .components(separatedBy: "→")
+                    .map { $0.trimmingCharacters(in: .whitespaces) }
+                let convertedValues = values.map { convertToMmolL($0) }
+                let joined = convertedValues.joined(separator: "→")
+                let rebuilt = "\(targetOrISF): \(joined)"
+                updatedReason.replaceSubrange(range, with: rebuilt)
+
+            } else if glucoseValueString.contains("Eventual BG"), glucoseValueString.contains("<") {
+                // Handle Eventual BG XX < target
+                let parts = glucoseValueString.components(separatedBy: "<")
+                if parts.count == 2 {
+                    let bgPart = parts[0].replacingOccurrences(of: "Eventual BG", with: "").trimmingCharacters(in: .whitespaces)
+                    let targetValue = parts[1].trimmingCharacters(in: .whitespaces)
+                    let formattedBGPart = convertToMmolL(bgPart)
+                    let formattedTargetValue = convertToMmolL(targetValue)
+                    let formattedString = "Eventual BG \(formattedBGPart)<\(formattedTargetValue)"
+                    updatedReason.replaceSubrange(range, with: formattedString)
+                }
+
+            } else if glucoseValueString.contains("<") {
+                // Handle minGuardBG (or minPredBG, etc.) x < y
+                let parts = glucoseValueString.components(separatedBy: "<")
+                if parts.count == 2 {
+                    let firstValue = parts[0].trimmingCharacters(in: .whitespaces)
+                    let secondValue = parts[1].trimmingCharacters(in: .whitespaces)
+                    let formattedFirstValue = convertToMmolL(firstValue)
+                    let formattedSecondValue = convertToMmolL(secondValue)
+                    let formattedString = "minGuardBG \(formattedFirstValue)<\(formattedSecondValue)"
+                    updatedReason.replaceSubrange(range, with: formattedString)
+                }
+
+            } else if glucoseValueString.contains(">=") {
+                // Handle "Eventual BG X >= Y"
+                let parts = glucoseValueString.components(separatedBy: " >= ")
+                if parts.count == 2 {
+                    let firstValue = parts[0].replacingOccurrences(of: "Eventual BG", with: "")
+                        .trimmingCharacters(in: .whitespaces)
+                    let secondValue = parts[1].trimmingCharacters(in: .whitespaces)
+                    let formattedFirstValue = convertToMmolL(firstValue)
+                    let formattedSecondValue = convertToMmolL(secondValue)
+                    let formattedString = "Eventual BG \(formattedFirstValue) >= \(formattedSecondValue)"
+                    updatedReason.replaceSubrange(range, with: formattedString)
+                }
+
+            } else if glucoseValueString.contains(">"), glucoseValueString.contains("BG") {
+                // Handle "maxDelta 37 > 20% of BG 95" style
+                let localPattern = "(\\d+) > (\\d+)% of BG (\\d+)"
+                let localRegex = try! NSRegularExpression(pattern: localPattern)
+                let localMatches = localRegex.matches(
+                    in: glucoseValueString,
+                    range: NSRange(glucoseValueString.startIndex..., in: glucoseValueString)
+                )
+                if let localMatch = localMatches.first, localMatch.numberOfRanges == 4 {
+                    let range1 = Range(localMatch.range(at: 1), in: glucoseValueString)!
+                    let range2 = Range(localMatch.range(at: 2), in: glucoseValueString)!
+                    let range3 = Range(localMatch.range(at: 3), in: glucoseValueString)!
+
+                    let firstValue = convertToMmolL(String(glucoseValueString[range1]))
+                    let thirdValue = convertToMmolL(String(glucoseValueString[range3]))
+
+                    let oldSnippet =
+                        "\(glucoseValueString[range1]) > \(glucoseValueString[range2])% of BG \(glucoseValueString[range3])"
+                    let newSnippet = "\(firstValue) > \(glucoseValueString[range2])% of BG \(thirdValue)"
+
+                    let replaced = glucoseValueString.replacingOccurrences(of: oldSnippet, with: newSnippet)
+                    updatedReason.replaceSubrange(range, with: replaced)
+                }
+
+            } else {
+                // Handle everything else, e.g., "minPredBG 39", "Dev: 5", etc.
+                let parts = glucoseValueString.components(separatedBy: .whitespaces)
+                if parts.count >= 2 {
+                    var metric = parts[0]
+                    let value = parts[1]
+
+                    // Add ":" to the metric only if it doesn't already end with ":"
+                    if !metric.hasSuffix(":") {
+                        metric += ":"
+                    }
+                    let formattedValue = convertToMmolL(value)
+                    let formattedString = "\(metric) \(formattedValue)"
+                    updatedReason.replaceSubrange(range, with: formattedString)
+                }
+            }
+        }
+
+        return updatedReason
+    }
+}
+
+extension BaseNightscoutManager {
+    /// Injects TDD into the provided `reason` string if TDD is available.
+    ///
+    /// - Parameters:
+    ///   - reason: The raw reason string (e.g., "minPredBG=5.2, IOBpredBG=102").
+    ///   - tdd: The total daily dose of insulin.
+    /// - Returns: A modified reason string that includes "TDD: x U" appended
+    ///   after the last matched prediction term, or at the end if no match is found.
+    func injectTDD(into reason: String, tdd: Decimal?) -> String {
+        guard let tdd = tdd else { return reason }
+
+        let tddString = ", TDD: \(tdd) U"
+
+        // Regex that matches any of the keywords followed by an optional colon, whitespace, then a number.
+        let pattern = "(minPredBG|minGuardBG|IOBpredBG|COBpredBG|UAMpredBG):?\\s*(-?\\d+(?:\\.\\d+)?)"
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: []) else {
+            return reason + tddString
+        }
+
+        // Split the reason at the first semicolon (if present)
+        let components = reason.split(separator: ";", maxSplits: 1, omittingEmptySubsequences: false)
+        let mainPart = String(components[0])
+        let tailPart = components.count > 1 ? ";" + components[1] : ""
+
+        // Search only in the main part for the keywords
+        let nsRange = NSRange(mainPart.startIndex ..< mainPart.endIndex, in: mainPart)
+        let matches = regex.matches(in: mainPart, options: [], range: nsRange)
+
+        // If found, insert TDD after the last occurrence in the main part.
+        if let lastMatch = matches.last, let matchRange = Range(lastMatch.range, in: mainPart) {
+            var modifiedMainPart = mainPart
+            modifiedMainPart.insert(contentsOf: tddString, at: matchRange.upperBound)
+            return modifiedMainPart + tailPart
+        }
+
+        // If no match is found, append TDD at the end of the original reason string.
+        return reason + tddString
+    }
+}
