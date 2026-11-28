@@ -1,0 +1,1315 @@
+import Combine
+import CoreData
+import Foundation
+import LoopKit
+import Swinject
+import UIKit
+import WatchConnectivity
+
+/// Protocol defining the base functionality for Watch communication
+protocol WatchManager {
+    func setupWatchState() async -> WatchState?
+}
+
+protocol WatchStateTransport: AnyObject {
+    var isPaired: Bool { get }
+    var isWatchAppInstalled: Bool { get }
+    var isReachable: Bool { get }
+    var isComplicationEnabled: Bool { get }
+    var activationState: WCSessionActivationState { get }
+    var remainingComplicationUserInfoTransfers: Int { get }
+    var outstandingUserInfoTransfers: [WCSessionUserInfoTransfer] { get }
+    func activate()
+    func sendMessage(_ message: [String: Any], replyHandler: (([String: Any]) -> Void)?, errorHandler: ((Error) -> Void)?)
+    func updateApplicationContext(_ applicationContext: [String: Any]) throws
+    @discardableResult func transferUserInfo(_ userInfo: [String: Any]) -> WCSessionUserInfoTransfer
+    @discardableResult func transferCurrentComplicationUserInfo(_ userInfo: [String: Any]) -> WCSessionUserInfoTransfer
+}
+
+extension WCSession: WatchStateTransport {}
+
+/// Main implementation of the Watch communication manager
+/// Handles bidirectional communication between iPhone and Apple Watch
+final class BaseWatchManager: NSObject, WCSessionDelegate, Injectable, WatchManager {
+    var session: WatchStateTransport?
+
+    @Injected() var broadcaster: Broadcaster!
+    @Injected() private var apsManager: APSManager!
+    @Injected() private var settingsManager: SettingsManager!
+    @Injected() private var fileStorage: FileStorage!
+    @Injected() private var glucoseStorage: GlucoseStorage!
+    @Injected() private var determinationStorage: DeterminationStorage!
+    @Injected() private var overrideStorage: OverrideStorage!
+    @Injected() private var tempTargetStorage: TempTargetsStorage!
+    @Injected() private var adjustmentManager: AdjustmentManager!
+    @Injected() private var bolusCalculationManager: BolusCalculationManager!
+    @Injected() private var iobService: IOBService!
+    @Injected() private var notificationsManager: UserNotificationsManager!
+    @Injected() private var fetchGlucoseManager: FetchGlucoseManager!
+
+    private var units: GlucoseUnits = .mgdL
+    private var glucoseColorScheme: GlucoseColorScheme = .staticColor
+    private var lowGlucose: Decimal = 70.0
+    private var highGlucose: Decimal = 180.0
+    private var activeBolusAmount: Double = 0.0
+    private var lastComplicationTransferDate: Date = .distantPast
+
+    // Queue for handling Core Data change notifications
+    private let queue = DispatchQueue(label: "BaseWatchManagerManager.queue", qos: .utility)
+    private var coreDataPublisher: AnyPublisher<Set<NSManagedObjectID>, Never>?
+    private var subscriptions = Set<AnyCancellable>()
+
+    /// Only accessed on `queue`.
+    private var pendingPushSince: Date?
+    /// Longest wait for a running loop.
+    private static let maxLoopWait: TimeInterval = 30
+
+    typealias PumpEvent = PumpEventStored.EventType
+
+    let viewContext = CoreDataStack.shared.persistentContainer.viewContext
+
+    init(
+        resolver: Resolver,
+        entityChanges: AnyPublisher<Set<NSManagedObjectID>, Never> = CoreDataStack.shared.contentChangePublisher
+    ) {
+        super.init()
+        injectServices(resolver)
+        setupWatchSession()
+
+        units = settingsManager.settings.units
+        glucoseColorScheme = settingsManager.settings.glucoseColorScheme
+        lowGlucose = settingsManager.settings.low
+        highGlucose = settingsManager.settings.high
+        broadcaster.register(SettingsObserver.self, observer: self)
+        broadcaster.register(PumpSettingsObserver.self, observer: self)
+        broadcaster.register(SnoozeObserver.self, observer: self)
+
+        // Observer for OrefDetermination and adjustments
+        coreDataPublisher =
+            entityChanges
+                .receive(on: queue)
+                .share()
+                .eraseToAnyPublisher()
+
+        // Observer for glucose and manual glucose
+        glucoseStorage.updatePublisher
+            .receive(on: DispatchQueue.global(qos: .background))
+            .sink { [weak self] _ in
+                self?.scheduleWatchStatePush()
+            }
+            .store(in: &subscriptions)
+
+        iobService.iobPublisher
+            .receive(on: DispatchQueue.global(qos: .background))
+            .sink { [weak self] _ in
+                self?.scheduleWatchStatePush()
+            }
+            .store(in: &subscriptions)
+
+        registerHandlers()
+    }
+
+    /// Bundles triggers that land together.
+    private func scheduleWatchStatePush() {
+        guard let session = session, session.isPaired, session.isWatchAppInstalled else { return }
+
+        queue.async { [weak self] in
+            guard let self, self.pendingPushSince == nil else { return }
+            self.pendingPushSince = Date()
+            self.pushAfterLoop(delay: 0.5)
+        }
+    }
+
+    /// Waits for a running loop, capped. Only on `queue`.
+    private func pushAfterLoop(delay: TimeInterval) {
+        queue.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self, let since = self.pendingPushSince else { return }
+            if self.apsManager.isLooping.value, Date().timeIntervalSince(since) < Self.maxLoopWait {
+                self.pushAfterLoop(delay: 1)
+                return
+            }
+            self.pendingPushSince = nil
+            Task {
+                await self.pushWatchState()
+            }
+        }
+    }
+
+    private func pushWatchState() async {
+        guard let state = await setupWatchState() else { return }
+        await sendDataToWatch(state)
+    }
+
+    private func registerHandlers() {
+        coreDataPublisher?.filteredByEntityName("OrefDetermination").sink { [weak self] _ in
+            self?.scheduleWatchStatePush()
+        }.store(in: &subscriptions)
+
+        // Due to the Batch insert this only is used for observing Deletion of Glucose entries
+        coreDataPublisher?.filteredByEntityName("GlucoseStored").sink { [weak self] _ in
+            self?.scheduleWatchStatePush()
+        }.store(in: &subscriptions)
+
+        coreDataPublisher?.filteredByEntityName("PumpEventStored").sink { [weak self] _ in
+            guard let self = self else { return }
+            Task {
+                await self.getActiveBolusAmount()
+            }
+        }.store(in: &subscriptions)
+
+        coreDataPublisher?.filteredByEntityName("OverrideStored").sink { [weak self] _ in
+            self?.scheduleWatchStatePush()
+        }.store(in: &subscriptions)
+
+        coreDataPublisher?.filteredByEntityName("TempTargetStored").sink { [weak self] _ in
+            self?.scheduleWatchStatePush()
+        }.store(in: &subscriptions)
+    }
+
+    /// Sets up the WatchConnectivity session if the device supports it
+    private func setupWatchSession() {
+        if WCSession.isSupported() {
+            let session = WCSession.default
+            session.delegate = self
+            session.activate()
+            self.session = session
+
+            debug(.watch, "Watch session set up, paired: \(session.isPaired)")
+        } else {
+            debug(.watch, "Watch connectivity not supported on this device")
+        }
+    }
+
+    /// Attempts to reestablish the Watch connection if it becomes unreachable
+    private func retryConnection() {
+        guard let session = session else { return }
+
+        if !session.isReachable {
+            debug(.watch, "Reactivating watch session")
+            session.activate()
+        }
+    }
+
+    /// Prepares the current state data to be sent to the Watch
+    /// - Returns: WatchState containing current glucose readings and trends and determination infos for displaying cob and iob in the view, or nil when there is nothing to send
+    func setupWatchState() async -> WatchState? {
+        // Unreachable watches still get the context.
+        guard let session = session, session.isPaired, session.isWatchAppInstalled else {
+            debug(.watch, "Watch state skipped: no watch paired or app not installed")
+            return nil
+        }
+
+        // Skip if watch session is not activated
+        guard session.activationState == .activated else {
+            debug(.watch, "Watch state skipped: session not activated")
+            return nil
+        }
+        do {
+            let context = CoreDataStack.shared.newTaskContext()
+            context.name = "setupWatchState"
+
+            // Get NSManagedObjectIDs
+            let glucoseIds = try await fetchGlucose()
+            let determinationIds = try await determinationStorage.fetchLastDeterminationObjectID(
+                predicate: NSPredicate.predicateFor30MinAgoForDetermination
+            )
+            let overridePresetIds = try await overrideStorage.fetchForOverridePresets()
+            let tempTargetPresetIds = try await tempTargetStorage.fetchForTempTargetPresets()
+            // Per build: the target follows the time.
+            let currentGlucoseTarget = await getCurrentGlucoseTarget() ?? Decimal(100)
+
+            // Get NSManagedObjects
+            let glucoseObjects: [GlucoseStored] = try await CoreDataStack.shared
+                .getNSManagedObject(with: glucoseIds, context: context)
+            let determinationObjects: [OrefDetermination] = try await CoreDataStack.shared
+                .getNSManagedObject(with: determinationIds, context: context)
+            let overridePresetObjects: [OverrideStored] = try await CoreDataStack.shared
+                .getNSManagedObject(with: overridePresetIds, context: context)
+            let tempTargetPresetObjects: [TempTargetStored] = try await CoreDataStack.shared
+                .getNSManagedObject(with: tempTargetPresetIds, context: context)
+
+            let watchState: WatchState = await context.perform {
+                var watchState = WatchState(date: Date())
+                watchState.snoozeUntilDate = UserDefaults.standard
+                    .object(forKey: "UserNotificationsManager.snoozeUntilDate") as? Date ?? .distantPast
+
+                // Set lastLoopDate
+                let lastLoopMinutes = Int((Date().timeIntervalSince(self.apsManager.lastLoopDate) - 30) / 60) + 1
+                if lastLoopMinutes > 1440 {
+                    watchState.lastLoopTime = "--"
+                } else {
+                    watchState.lastLoopTime = "\(lastLoopMinutes) min"
+                    watchState.lastLoopDate = self.apsManager.lastLoopDate
+                }
+
+                watchState.lowGlucoseLimit = self.units == .mgdL
+                    ? Double(truncating: self.lowGlucose as NSNumber)
+                    : Double(truncating: self.lowGlucose.asMmolL as NSNumber)
+                watchState.highGlucoseLimit = self.units == .mgdL
+                    ? Double(truncating: self.highGlucose as NSNumber)
+                    : Double(truncating: self.highGlucose.asMmolL as NSNumber)
+
+                // Set IOB and COB from latest determination
+                let iob = self.iobService.currentIOB ?? 0
+                watchState.iob = iob.formattedIOB()
+
+                if let latestDetermination = determinationObjects.first {
+                    let cob = NSNumber(value: latestDetermination.cob)
+                    watchState.cob = Formatter.integerFormatter.string(from: cob)
+                }
+
+                // Set override presets with their enabled status
+                watchState.overridePresets = overridePresetObjects.map { override in
+                    OverridePresetWatch(
+                        name: override.name ?? "",
+                        isEnabled: override.enabled
+                    )
+                }
+
+                guard let latestGlucose = glucoseObjects.first else {
+                    return watchState
+                }
+
+                // Assign currentGlucose and its color
+                /// Set current glucose with proper formatting
+                watchState.currentGlucose = Decimal(latestGlucose.glucose).formatted(for: self.units)
+
+                /// Calculate latest color
+                let hardCodedLow = Decimal(55)
+                let hardCodedHigh = Decimal(220)
+                let isDynamicColorScheme = self.glucoseColorScheme == .dynamicColor
+
+                let highGlucoseValue = isDynamicColorScheme ? hardCodedHigh : self.highGlucose
+                let lowGlucoseValue = isDynamicColorScheme ? hardCodedLow : self.lowGlucose
+                let highGlucoseColorValue = highGlucoseValue
+                let lowGlucoseColorValue = lowGlucoseValue
+                let targetGlucose = currentGlucoseTarget
+
+                let currentGlucoseColor = Trio.getDynamicGlucoseColor(
+                    glucoseValue: Decimal(latestGlucose.glucose),
+                    highGlucoseColorValue: highGlucoseColorValue,
+                    lowGlucoseColorValue: lowGlucoseColorValue,
+                    targetGlucose: targetGlucose,
+                    glucoseColorScheme: self.glucoseColorScheme
+                )
+
+                watchState.complicationRingStops = Trio.complicationRingStops(
+                    highGlucoseColorValue: highGlucoseColorValue,
+                    lowGlucoseColorValue: lowGlucoseColorValue,
+                    targetGlucose: targetGlucose,
+                    glucoseColorScheme: self.glucoseColorScheme
+                )
+
+                if Decimal(latestGlucose.glucose) <= self.lowGlucose || Decimal(latestGlucose.glucose) >= self.highGlucose {
+                    watchState.currentGlucoseColorString = currentGlucoseColor.toHexString()
+                } else {
+                    watchState.currentGlucoseColorString = "#ffffff" // white when in range; colored when out of range
+                }
+
+                // Map glucose values
+                watchState.glucoseValues = glucoseObjects.compactMap { glucose in
+                    let glucoseValue = self.units == .mgdL
+                        ? Double(glucose.glucose)
+                        : Double(truncating: Decimal(glucose.glucose).asMmolL as NSNumber)
+
+                    let glucoseColor = Trio.getDynamicGlucoseColor(
+                        glucoseValue: Decimal(glucose.glucose),
+                        highGlucoseColorValue: highGlucoseColorValue,
+                        lowGlucoseColorValue: lowGlucoseColorValue,
+                        targetGlucose: targetGlucose,
+                        glucoseColorScheme: self.glucoseColorScheme
+                    )
+
+                    return WatchGlucoseObject(
+                        date: glucose.date ?? Date(),
+                        glucose: glucoseValue,
+                        color: glucoseColor.toHexString()
+                    )
+                }
+                .sorted { $0.date < $1.date }
+
+                // Set axis domain: min and max Y-axis values
+                // Apply unit parsing conditionally, if user uses mmol/L
+                let maxGlucoseValue = Decimal(glucoseObjects.map { Int($0.glucose) }.max() ?? 200)
+                var maxYValue = Decimal(200)
+
+                if maxGlucoseValue > maxYValue, maxGlucoseValue <= 225 {
+                    maxYValue = Decimal(250)
+                } else if maxGlucoseValue > 225, maxGlucoseValue <= 275 {
+                    maxYValue = Decimal(300)
+                } else if maxGlucoseValue > 275, maxGlucoseValue <= 325 {
+                    maxYValue = Decimal(350)
+                } else if maxGlucoseValue > 325 {
+                    maxYValue = Decimal(400)
+                }
+
+                if self.units == .mmolL {
+                    maxYValue = Double(truncating: maxYValue as NSNumber).asMmolL
+                }
+                watchState.maxYAxisValue = maxYValue
+
+                if self.units == .mmolL {
+                    let minYValue = Double(truncating: watchState.minYAxisValue as NSNumber).asMmolL
+                    watchState.minYAxisValue = minYValue
+                }
+
+                // Convert direction to trend string
+                watchState.trend = latestGlucose.direction
+
+                // Calculate delta if we have at least 2 readings
+                if glucoseObjects.count >= 2 {
+                    let glucoseLast = Decimal(glucoseObjects[0].glucose)
+                    let glucoseSecondLast = Decimal(glucoseObjects[1].glucose)
+                    watchState.delta = (glucoseLast - glucoseSecondLast).formattedDelta(for: self.units)
+                }
+
+                // Set temp target presets with their enabled status
+                watchState.tempTargetPresets = tempTargetPresetObjects.map { tempTarget in
+                    TempTargetPresetWatch(
+                        name: tempTarget.name ?? "",
+                        isEnabled: tempTarget.enabled
+                    )
+                }
+
+                // Set units
+                watchState.units = self.units
+
+                // Add limits and pump specific dosing increment settings values
+                watchState.maxBolus = self.settingsManager.pumpSettings.maxBolus
+                watchState.maxCarbs = self.settingsManager.settings.maxCarbs
+                watchState.maxFat = self.settingsManager.settings.maxFat
+                watchState.maxProtein = self.settingsManager.settings.maxProtein
+                watchState.bolusIncrement = self.settingsManager.preferences.bolusIncrement
+                watchState.confirmBolusFaster = self.settingsManager.settings.confirmBolusFaster
+
+                watchState.complicationCornerValue = self.settingsManager.settings.watchComplicationCornerValue
+                watchState.complicationSecondaryValue = self.settingsManager.settings.watchComplicationSecondaryValue
+                watchState.complicationStaleMinutes = self.settingsManager.settings.watchComplicationStaleMinutes
+                watchState.complicationColorMode = self.settingsManager.settings.watchComplicationColorMode
+
+                watchState.useCriticalAlertsWatch = self.settingsManager.settings.useCriticalAlertsWatch
+                watchState.showForecast = self.settingsManager.settings.showForecastWatch
+                watchState.isForecastCone = self.settingsManager.settings.forecastDisplayType == .cone
+
+                // the watch reads the sensor itself while the CGM shares its configuration (G7: Read on Apple Watch),
+                // as LoopKit/Loop#2545's WatchDataManager does
+                let sharingCGM = self.fetchGlucoseManager.cgmManager as? DeviceConfigurationSharing
+                watchState.watchReadsSensor = sharingCGM?.isConfigurationSharingEnabled ?? false
+                if let cgm = sharingCGM, cgm.isConfigurationSharingEnabled {
+                    // without the export's time, so an unchanged sensor leaves the watch state unchanged
+                    let export = cgm.exportConfiguration()
+                    let configuration = SharedDeviceConfiguration(
+                        managerIdentifier: export.managerIdentifier,
+                        asOf: .distantPast,
+                        deliveredUnits: nil,
+                        state: export.state
+                    )
+                    watchState.watchSensorConfiguration = try? PropertyListSerialization.data(
+                        fromPropertyList: configuration.rawValue,
+                        format: .binary,
+                        options: 0
+                    )
+                }
+                watchState.glucoseRangeLow = self.lowGlucose
+                watchState.glucoseRangeHigh = self.highGlucose
+                watchState.glucoseRangeTarget = currentGlucoseTarget
+                watchState.glucoseColorScheme = self.glucoseColorScheme.rawValue
+
+                // Forecast data comes from OrefDetermination's `forecasts` CoreData
+                // relationship (Set<Forecast>), NOT a `.predictions` property.
+                if let latestDetermination = determinationObjects.first,
+                   let forecastsSet = latestDetermination.forecasts,
+                   !forecastsSet.isEmpty
+                {
+                    let anchorDate = latestDetermination.deliverAt ?? latestDetermination.timestamp ?? Date()
+                    watchState.forecastStartDate = anchorDate
+
+                    // Rebuild a [type: [Int]] dictionary from the CoreData relationship.
+                    // Strictly cap to 24 points (2 hours of 5-minute forecasts)
+                    var rawPredictions: [String: [Int]] = [:]
+                    for forecast in forecastsSet {
+                        guard let type = forecast.type else { continue }
+                        let values = Array(forecast.forecastValuesArray.map { Int($0.value) }.prefix(24))
+                        guard !values.isEmpty else { continue }
+                        rawPredictions[type] = values
+                    }
+
+                    func convert(_ values: [Int]?) -> [Double] {
+                        guard let values = values else { return [] }
+                        return values.map { raw in
+                            self.units == .mgdL ? Double(raw) : Double(truncating: Decimal(raw).asMmolL as NSNumber)
+                        }
+                    }
+
+                    if watchState.isForecastCone {
+                        let allSeries: [[Int]] = [
+                            rawPredictions["iob"],
+                            rawPredictions["zt"],
+                            rawPredictions["cob"],
+                            rawPredictions["uam"]
+                        ].compactMap { $0 }
+
+                        // Change .max() to .min() so the shortest prediction line cuts off the cone
+                        let count = allSeries.map(\.count).min() ?? 0
+
+                        var coneMin: [Double] = []
+                        var coneMax: [Double] = []
+                        for i in 0 ..< count {
+                            let valuesAtIndex = allSeries.compactMap { $0.indices.contains(i) ? $0[i] : nil }
+                            guard let minRaw = valuesAtIndex.min(), let maxRaw = valuesAtIndex.max() else { continue }
+                            coneMin.append(convert([minRaw])[0])
+                            coneMax.append(convert([maxRaw])[0])
+                        }
+                        watchState.forecastConeMin = coneMin
+                        watchState.forecastConeMax = coneMax
+                        watchState.forecastLines = [:]
+                    } else {
+                        var lines: [String: [Double]] = [:]
+                        if let iob = rawPredictions["iob"] { lines["iob"] = convert(iob) }
+                        if let cob = rawPredictions["cob"] { lines["cob"] = convert(cob) }
+                        if let uam = rawPredictions["uam"] { lines["uam"] = convert(uam) }
+                        if let zt = rawPredictions["zt"] { lines["zt"] = convert(zt) }
+                        watchState.forecastLines = lines
+                        watchState.forecastConeMin = []
+                        watchState.forecastConeMax = []
+                    }
+                } else {
+                    watchState.forecastStartDate = nil
+                    watchState.forecastConeMin = []
+                    watchState.forecastConeMax = []
+                    watchState.forecastLines = [:]
+                }
+
+                debug(
+                    .watch,
+                    "Watch state built: glucose \(watchState.currentGlucose ?? "none"), trend \(watchState.trend ?? "none"), delta \(watchState.delta ?? "none"), \(watchState.glucoseValues.count) readings"
+                )
+
+                return watchState
+            }
+
+            return watchState
+        } catch {
+            warning(.watch, "Building watch state failed", error: error)
+            return nil
+        }
+    }
+
+    /// Fetches recent glucose readings from CoreData
+    /// - Returns: Array of NSManagedObjectIDs for glucose readings
+    private func fetchGlucose() async throws -> [NSManagedObjectID] {
+        let context = CoreDataStack.shared.newTaskContext()
+        context.name = "fetchGlucose"
+        let results = try await CoreDataStack.shared.fetchEntitiesAsync(
+            ofType: GlucoseStored.self,
+            onContext: context,
+            predicate: NSPredicate.glucose,
+            key: "date",
+            ascending: false
+        )
+
+        return try await context.perform {
+            guard let fetchedResults = results as? [GlucoseStored] else {
+                throw CoreDataError.fetchError(function: #function, file: #file)
+            }
+
+            return fetchedResults.map(\.objectID)
+        }
+    }
+
+    /// Fetches last pump event that is a non-external bolus from CoreData
+    /// - Returns: NSManagedObjectIDs for last bolus
+    func fetchLastBolus() async throws -> NSManagedObjectID? {
+        let context = CoreDataStack.shared.newTaskContext()
+        context.name = "fetchLastBolus"
+        let results = try await CoreDataStack.shared.fetchEntitiesAsync(
+            ofType: PumpEventStored.self,
+            onContext: context,
+            predicate: NSPredicate.lastPumpBolus,
+            key: "timestamp",
+            ascending: false,
+            fetchLimit: 1,
+            relationshipKeyPathsForPrefetching: ["bolus"]
+        )
+
+        return try await context.perform {
+            guard let fetchedResults = results as? [PumpEventStored] else {
+                throw CoreDataError.fetchError(function: #function, file: #file)
+            }
+
+            return fetchedResults.map(\.objectID).first
+        }
+    }
+
+    /// Gets the active bolus amount by fetching last (active) bolus.
+    @MainActor func getActiveBolusAmount() async {
+        do {
+            if let lastBolusObjectId = try await fetchLastBolus() {
+                let lastBolusObject: [PumpEventStored] = try await CoreDataStack.shared
+                    .getNSManagedObject(with: [lastBolusObjectId], context: viewContext)
+
+                activeBolusAmount = lastBolusObject.first?.bolus?.amount?.doubleValue ?? 0.0
+            }
+        } catch {
+            warning(.watch, "Fetching active bolus amount failed", error: error)
+        }
+    }
+
+    // MARK: - Send to Watch
+
+    static func watchStateToDictionary(from state: WatchState) -> [String: Any] {
+        var dictionary: [String: Any] = [
+            WatchMessageKeys.date: state.date.timeIntervalSince1970,
+            WatchMessageKeys.currentGlucose: state.currentGlucose ?? "--",
+            WatchMessageKeys.currentGlucoseColorString: state.currentGlucoseColorString ?? "#ffffff",
+            WatchMessageKeys.trend: state.trend ?? "",
+            WatchMessageKeys.delta: state.delta ?? "",
+            WatchMessageKeys.iob: state.iob ?? "",
+            WatchMessageKeys.cob: state.cob ?? "",
+            WatchMessageKeys.lastLoopTime: state.lastLoopTime ?? "",
+            WatchMessageKeys.lastLoopDate: state.lastLoopDate?.timeIntervalSince1970 ?? 0,
+            WatchMessageKeys.glucoseValues: state.glucoseValues.map { value in
+                [
+                    "glucose": value.glucose,
+                    "date": value.date.timeIntervalSince1970,
+                    "color": value.color
+                ]
+            },
+            WatchMessageKeys.minYAxisValue: state.minYAxisValue,
+            WatchMessageKeys.maxYAxisValue: state.maxYAxisValue,
+            WatchMessageKeys.overridePresets: state.overridePresets.map { preset in
+                [
+                    "name": preset.name,
+                    "isEnabled": preset.isEnabled
+                ]
+            },
+            WatchMessageKeys.tempTargetPresets: state.tempTargetPresets.map { preset in
+                [
+                    "name": preset.name,
+                    "isEnabled": preset.isEnabled
+                ]
+            },
+            WatchMessageKeys.maxBolus: state.maxBolus,
+            WatchMessageKeys.maxCarbs: state.maxCarbs,
+            WatchMessageKeys.maxFat: state.maxFat,
+            WatchMessageKeys.maxProtein: state.maxProtein,
+            WatchMessageKeys.bolusIncrement: state.bolusIncrement,
+            WatchMessageKeys.confirmBolusFaster: state.confirmBolusFaster,
+            WatchMessageKeys.complicationCornerValue: state.complicationCornerValue.rawValue,
+            WatchMessageKeys.complicationSecondaryValue: state.complicationSecondaryValue.rawValue,
+            WatchMessageKeys.complicationStaleMinutes: state.complicationStaleMinutes,
+            WatchMessageKeys.complicationColorMode: state.complicationColorMode.rawValue,
+            WatchMessageKeys.complicationRingStops: state.complicationRingStops.map(\.payload),
+            WatchMessageKeys.units: state.units.rawValue,
+            WatchMessageKeys.showForecastWatch: state.showForecast,
+            WatchMessageKeys.isForecastCone: state.isForecastCone,
+            WatchMessageKeys.snoozeUntilDate: state.snoozeUntilDate.timeIntervalSince1970
+        ]
+
+        if let lowGlucoseLimit = state.lowGlucoseLimit {
+            dictionary[WatchMessageKeys.lowGlucoseLimit] = lowGlucoseLimit
+        }
+        if let highGlucoseLimit = state.highGlucoseLimit {
+            dictionary[WatchMessageKeys.highGlucoseLimit] = highGlucoseLimit
+        }
+
+        var forecastData: [String: Any] = [
+            WatchMessageKeys.forecastConeMin: state.forecastConeMin,
+            WatchMessageKeys.forecastConeMax: state.forecastConeMax,
+            WatchMessageKeys.forecastLines: state.forecastLines
+        ]
+
+        if let start = state.forecastStartDate?.timeIntervalSince1970 {
+            forecastData[WatchMessageKeys.forecastStartDate] = start
+        }
+
+        dictionary[WatchMessageKeys.forecastData] = forecastData
+
+        dictionary[WatchMessageKeys.useCriticalAlertsWatch] = state.useCriticalAlertsWatch
+        dictionary[WatchMessageKeys.watchSensorConfiguration] = state.watchSensorConfiguration
+        dictionary[WatchMessageKeys.watchReadsSensor] = state.watchReadsSensor
+        dictionary[WatchMessageKeys.glucoseRangeLow] = NSDecimalNumber(decimal: state.glucoseRangeLow).doubleValue
+        dictionary[WatchMessageKeys.glucoseRangeHigh] = NSDecimalNumber(decimal: state.glucoseRangeHigh).doubleValue
+        dictionary[WatchMessageKeys.glucoseRangeTarget] = NSDecimalNumber(decimal: state.glucoseRangeTarget).doubleValue
+        dictionary[WatchMessageKeys.glucoseColorScheme] = state.glucoseColorScheme
+        // the phone's glucose alarms, for the watch's own readings: the highest low, the lowest high that is on
+        let alerts = GlucoseAlertsStore.shared.alerts
+        func thresholds(_ type: GlucoseAlertType) -> [Double] {
+            alerts.filter { $0.type == type && $0.shouldEvaluate }.map { NSDecimalNumber(decimal: $0.thresholdMgDL).doubleValue }
+        }
+        dictionary[WatchMessageKeys.glucoseAlarmUrgentLow] = thresholds(.urgentLow).max() ?? 54
+        dictionary[WatchMessageKeys.glucoseAlarmLow] = thresholds(.low).max() ?? 0
+        dictionary[WatchMessageKeys.glucoseAlarmHigh] = thresholds(.high).min() ?? 0
+        return dictionary
+    }
+
+    // MARK: - Watch state payloads
+
+    /// Sends the state of type WatchState to the connected Watch
+    /// - Parameter state: Current WatchState containing glucose data to be sent
+    @MainActor func sendDataToWatch(_ state: WatchState) async {
+        guard let session = session, let payload = buildWatchStatePayload(state) else { return }
+        updateApplicationContext(with: payload)
+
+        // Reachable means foreground: also send a message.
+        guard session.isReachable else {
+            transferComplicationIfDue(session, payload: payload)
+            return
+        }
+
+        session.sendMessage([WatchMessageKeys.watchState: payload], replyHandler: nil) { error in
+            warning(.watch, "Sending watch state failed", error: error)
+        }
+    }
+
+    /// Payload stamped with the send time.
+    @MainActor private func buildWatchStatePayload(_ state: WatchState) -> [String: Any]? {
+        guard let session = session else { return nil }
+
+        guard session.isPaired else {
+            debug(.watch, "No watch paired")
+            return nil
+        }
+
+        guard session.isWatchAppInstalled else {
+            debug(.watch, "Trio watch app not installed")
+            return nil
+        }
+
+        guard session.activationState == .activated else {
+            debug(.watch, "Watch session not activated (state \(session.activationState.rawValue)), reactivating")
+            session.activate()
+            return nil
+        }
+
+        // Stamp the snapshot with send time. Each push gets a strictly newer
+        // `date` than the previous one, which is what the watch's monotonicity
+        // dedup relies on — including watch-requested re-pushes when no CGM
+        // tick has bumped the build-time date.
+        var state = state
+        state.date = Date()
+
+        return Self.watchStateToDictionary(from: state)
+    }
+
+    @MainActor private func updateApplicationContext(with payload: [String: Any]) {
+        do {
+            try session?.updateApplicationContext([WatchMessageKeys.watchState: payload])
+        } catch {
+            warning(.watch, "Updating the watch application context failed", error: error)
+        }
+    }
+
+    @MainActor private func transferComplicationIfDue(_ session: WatchStateTransport, payload: [String: Any]) {
+        let now = Date()
+        guard session.isComplicationEnabled, ComplicationTransferBudget.isTransferDue(
+            at: now,
+            lastTransfer: lastComplicationTransferDate,
+            remainingTransfers: session.remainingComplicationUserInfoTransfers
+        ) else { return }
+        session.outstandingUserInfoTransfers
+            .filter { $0.isCurrentComplicationInfo }
+            .forEach { $0.cancel() }
+        session.transferCurrentComplicationUserInfo([WatchMessageKeys.watchState: payload])
+        lastComplicationTransferDate = now
+        info(.watch, "Transferred new WatchState snapshot for the complication")
+    }
+
+    func sendAcknowledgment(toWatch success: Bool, message: String = "", ackCode: AcknowledgmentCode) {
+        guard let session = session, session.isReachable else {
+            debug(.watch, "Watch not reachable, acknowledgment not sent")
+            return
+        }
+
+        let ackMessage: [String: Any] = [
+            WatchMessageKeys.acknowledged: success,
+            WatchMessageKeys.message: message,
+            WatchMessageKeys.ackCode: ackCode.rawValue
+        ]
+
+        session.sendMessage(ackMessage, replyHandler: nil) { error in
+            warning(.watch, "Sending acknowledgment to watch failed", error: error)
+        }
+    }
+
+    // MARK: - WCSessionDelegate
+
+    func session(_ session: WCSession, activationDidCompleteWith activationState: WCSessionActivationState, error: Error?) {
+        if let error = error {
+            warning(.watch, "Watch session activation failed", error: error)
+            return
+        }
+
+        info(.watch, "Watch session activated, state \(activationState.rawValue), reachable: \(session.isReachable)")
+
+        // Try to send initial data after activation
+        Task {
+            await self.pushWatchState()
+        }
+    }
+
+    /// Every path must call `replyHandler`.
+    func session(
+        _ session: WCSession,
+        didReceiveMessage message: [String: Any],
+        replyHandler: @escaping ([String: Any]) -> Void
+    ) {
+        guard let requestWatchUpdate = message[WatchMessageKeys.requestWatchUpdate] as? String,
+              requestWatchUpdate == WatchMessageKeys.watchState
+        else {
+            replyHandler([:])
+            self.session(session, didReceiveMessage: message)
+            return
+        }
+
+        debug(.watch, "Watch requested a state update")
+
+        Task { @MainActor [weak self] in
+            guard let self else {
+                replyHandler([:])
+                return
+            }
+
+            guard let state = await self.setupWatchState(),
+                  let payload = self.buildWatchStatePayload(state)
+            else {
+                replyHandler([:])
+                return
+            }
+            // Context as fresh as the reply.
+            self.updateApplicationContext(with: payload)
+            replyHandler([WatchMessageKeys.watchState: payload])
+        }
+    }
+
+    func session(_: WCSession, didReceiveMessage message: [String: Any]) {
+        // Handle logs first - doesn't need self, so it can run even during teardown
+        if let logs = message["watchLogs"] as? String {
+            WatchLogIngest.legacyRecords(from: logs).forEach(TrioLogger.sink.accept)
+            if message.count == 1 { return }
+        }
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+
+            // Older watch apps ask without reply handler.
+            if message[WatchMessageKeys.requestWatchUpdate] as? String == WatchMessageKeys.watchState {
+                debug(.watch, "Watch requested a state update without a reply handler")
+                await self.pushWatchState()
+                return
+            }
+
+            if let snoozeMinutes = message[WatchMessageKeys.snoozeDuration] as? Int {
+                info(.watch, "Watch requested alert snooze for \(snoozeMinutes) min")
+                await self.notificationsManager.applySnooze(for: TimeInterval(snoozeMinutes * 60))
+                return
+            } else if let bolusAmount = message[WatchMessageKeys.bolus] as? Double,
+                      message[WatchMessageKeys.carbs] == nil,
+                      message[WatchMessageKeys.date] == nil
+            {
+                info(.watch, "Watch requested bolus of \(bolusAmount) U")
+                self.handleBolusRequest(Decimal(bolusAmount))
+            } else if let carbsAmount = message[WatchMessageKeys.carbs] as? Int,
+                      let timestamp = message[WatchMessageKeys.date] as? TimeInterval,
+                      message[WatchMessageKeys.bolus] == nil
+            {
+                let date = Date(timeIntervalSince1970: timestamp)
+                info(.watch, "Watch requested \(carbsAmount) g carbs at \(date)")
+                self.handleCarbsRequest(carbsAmount, date)
+            } else if let bolusAmount = message[WatchMessageKeys.bolus] as? Double,
+                      let carbsAmount = message[WatchMessageKeys.carbs] as? Int,
+                      let timestamp = message[WatchMessageKeys.date] as? TimeInterval
+            {
+                let date = Date(timeIntervalSince1970: timestamp)
+                info(.watch, "Watch requested bolus of \(bolusAmount) U with \(carbsAmount) g carbs at \(date)")
+                self.handleCombinedRequest(bolusAmount: Decimal(bolusAmount), carbsAmount: Decimal(carbsAmount), date: date)
+            } else if message[WatchMessageKeys.cancelOverride] == nil,
+                      message[WatchMessageKeys.activateOverride] == nil,
+                      message[WatchMessageKeys.cancelTempTarget] == nil,
+                      message[WatchMessageKeys.activateTempTarget] == nil,
+                      message[WatchMessageKeys.requestBolusRecommendation] == nil
+            {
+                warning(
+                    .watch,
+                    "Invalid or incomplete message from watch, keys: \(message.keys.sorted().joined(separator: ", "))"
+                )
+                // Acknowledge failure
+                self.sendAcknowledgment(
+                    toWatch: false,
+                    message: "Error! Invalid or incomplete data received from watch.",
+                    ackCode: .genericFailure
+                )
+            }
+
+            if message[WatchMessageKeys.cancelOverride] as? Bool == true {
+                info(.watch, "Watch requested override cancel")
+                self.handleCancelOverride()
+            }
+
+            if let presetName = message[WatchMessageKeys.activateOverride] as? String {
+                info(.watch, "Watch requested override preset \(presetName)")
+                self.handleActivateOverride(presetName)
+            }
+
+            if let presetName = message[WatchMessageKeys.activateTempTarget] as? String {
+                info(.watch, "Watch requested temp target preset \(presetName)")
+                self.handleActivateTempTarget(presetName)
+            }
+
+            if message[WatchMessageKeys.cancelTempTarget] as? Bool == true {
+                info(.watch, "Watch requested temp target cancel")
+                self.handleCancelTempTarget()
+            }
+
+            if message[WatchMessageKeys.requestBolusRecommendation] as? Bool == true {
+                let carbs = message[WatchMessageKeys.carbs] as? Int ?? 0
+
+                var minPredBG: Decimal = 54
+
+                Task { [weak self] in
+                    guard let self = self else { return }
+
+                    do {
+                        let context = CoreDataStack.shared.newTaskContext()
+                        context.name = "requestBolusRecommendation"
+                        // Fetch determination data
+                        let determinationIds = try await determinationStorage.fetchLastDeterminationObjectID(
+                            predicate: NSPredicate.predicateFor30MinAgoForDetermination
+                        )
+                        let determinationObjects: [OrefDetermination] = try await CoreDataStack.shared.getNSManagedObject(
+                            with: determinationIds,
+                            context: context
+                        )
+
+                        await MainActor.run {
+                            minPredBG = determinationObjects.first?.minPredBGFromReason ?? 54
+                        }
+
+                    } catch let error as CoreDataError {
+                        warning(.watch, "Fetching determination for watch bolus recommendation failed", error: error)
+                    } catch {
+                        warning(.watch, "Fetching determination for watch bolus recommendation failed", error: error)
+                    }
+
+                    // Get recommendation from BolusCalculationManager
+                    let result = await bolusCalculationManager.handleBolusCalculation(
+                        carbs: Decimal(carbs),
+                        useFattyMealCorrection: false,
+                        useSuperBolus: false,
+                        lastLoopDate: apsManager.lastLoopDate,
+                        minPredBG: minPredBG,
+                        simulatedCOB: nil,
+                        isBackdated: false // we cannot backdate carbs via watch
+                    )
+
+                    // Send recommendation back to watch
+                    let recommendationMessage: [String: Any] = [
+                        WatchMessageKeys.recommendedBolus: NSDecimalNumber(decimal: result.insulinCalculated)
+                    ]
+
+                    if let session = self.session, session.isReachable {
+                        debug(.watch, "Sending recommended bolus \(result.insulinCalculated) U to watch")
+                        session.sendMessage(recommendationMessage, replyHandler: nil, errorHandler: nil)
+                    }
+                }
+                return
+            }
+        }
+    }
+
+    func session(_: WCSession, didReceiveUserInfo userInfo: [String: Any] = [:]) {
+        if let logs = userInfo["watchLogs"] as? String {
+            WatchLogIngest.legacyRecords(from: logs).forEach(TrioLogger.sink.accept)
+        }
+
+        if let snoozeMinutes = userInfo[WatchMessageKeys.snoozeDuration] as? Int {
+            info(.watch, "Watch requested alert snooze for \(snoozeMinutes) min")
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                await self.notificationsManager.applySnooze(for: TimeInterval(snoozeMinutes * 60))
+            }
+        }
+    }
+
+    func session(_: WCSession, didReceive file: WCSessionFile) {
+        WatchLogIngest.shared.receive(file.fileURL, metadata: file.metadata)
+    }
+
+    #if os(iOS)
+        func sessionDidBecomeInactive(_: WCSession) {}
+        func sessionDidDeactivate(_ session: WCSession) {
+            session.activate()
+        }
+    #endif
+
+    func sessionReachabilityDidChange(_ session: WCSession) {
+        debug(.watch, "Watch reachable: \(session.isReachable)")
+
+        // A reachable watch asks for the state itself.
+        guard !session.isReachable else { return }
+
+        // Try to reconnect after a short delay
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+            self?.retryConnection()
+        }
+    }
+
+    /// Processes bolus requests received from the Watch
+    /// - Parameter amount: The requested bolus amount in units
+    private func handleBolusRequest(_ amount: Decimal) {
+        Task {
+            await apsManager.enactBolus(amount: Double(amount), isSMB: false) { success, message in
+                // Acknowledge success or error of bolus
+                self.sendAcknowledgment(
+                    toWatch: success,
+                    message: message,
+                    ackCode: success == true ? .genericSuccess : .genericFailure
+                )
+            }
+            debug(.bolus, "Watch bolus of \(amount) U handed to APS manager")
+        }
+    }
+
+    /// Handles carbs entry requests received from the Watch
+    /// - Parameters:
+    ///   - amount: The carbs amount in grams
+    ///   - date: Timestamp for the carbs entry
+    private func handleCarbsRequest(_ amount: Int, _ date: Date) {
+        Task {
+            let context = CoreDataStack.shared.newTaskContext()
+
+            await context.perform {
+                let carbEntry = CarbEntryStored(context: context)
+                carbEntry.id = UUID()
+                carbEntry.carbs = Double(truncating: amount as NSNumber)
+                carbEntry.date = date
+                carbEntry.note = String(localized: "Via Watch", comment: "Note added to carb entry when entered via watch")
+                carbEntry.isFPU = false // set this to false to ensure watch-entered carbs are displayed in main chart
+                carbEntry.isUploadedToNS = false
+                carbEntry.isUploadedToHealth = false
+                carbEntry.isUploadedToTidepool = false
+
+                do {
+                    guard context.hasChanges else {
+                        // Acknowledge failure
+                        self.sendAcknowledgment(
+                            toWatch: false,
+                            message: "Error! Something went wrong when processing your request.",
+                            ackCode: .genericFailure
+                        )
+                        return
+                    }
+                    try context.save()
+                    debug(.treatments, "Saved \(amount) g carbs from watch")
+
+                    // Acknowledge success
+                    self.sendAcknowledgment(
+                        toWatch: true,
+                        message: String(
+                            localized: "Carbs logged successfully.",
+                            comment: "Success message sent to watch when carbs are logged successfully"
+                        ),
+                        ackCode: .carbsLogged
+                    )
+                } catch let saveError {
+                    error(.treatments, "Saving carbs from watch failed", error: saveError)
+
+                    // Acknowledge failure
+                    self.sendAcknowledgment(toWatch: false, message: "Error logging carbs", ackCode: .genericFailure)
+                }
+            }
+        }
+    }
+
+    /// Handles combined bolus and carbs entry requests received from the Watch.
+    /// - Parameters:
+    ///   - bolusAmount: The bolus amount in units
+    ///   - carbsAmount: The carbs amount in grams
+    ///   - date: Timestamp for the carbs entry
+    private func handleCombinedRequest(bolusAmount: Decimal, carbsAmount: Decimal, date: Date) {
+        Task {
+            let context = CoreDataStack.shared.newTaskContext()
+
+            do {
+                // Notify Watch: "Saving carbs..."
+                self.sendAcknowledgment(
+                    toWatch: true,
+                    message: String(
+                        localized: "Saving Carbs...",
+                        comment: "Successful message sent to watch when saving carbs"
+                    ),
+                    ackCode: .savingCarbs
+                )
+
+                // Save carbs entry in Core Data
+                try await context.perform {
+                    let carbEntry = CarbEntryStored(context: context)
+                    carbEntry.id = UUID()
+                    carbEntry.carbs = NSDecimalNumber(decimal: carbsAmount).doubleValue
+                    carbEntry.date = date
+                    carbEntry.note = String(localized: "Via Watch", comment: "Note added to carb entry when entered via watch")
+                    carbEntry.isFPU = false // set this to false to ensure watch-entered carbs are displayed in main chart
+                    carbEntry.isUploadedToNS = false
+                    carbEntry.isUploadedToHealth = false
+                    carbEntry.isUploadedToTidepool = false
+
+                    guard context.hasChanges else {
+                        // Acknowledge failure
+                        self.sendAcknowledgment(
+                            toWatch: false,
+                            message: "Error! Something went wrong when processing your request.",
+                            ackCode: .genericFailure
+                        )
+                        return
+                    }
+                    try context.save()
+                    debug(.treatments, "Saved \(carbsAmount) g carbs from watch")
+                }
+
+                // Notify Watch: "Enacting bolus..."
+                sendAcknowledgment(
+                    toWatch: true,
+                    message: String(
+                        localized: "Enacting bolus...",
+                        comment: "Successful message sent to watch when enacting bolus"
+                    ),
+                    ackCode: .enactingBolus
+                )
+
+                // Enact bolus via APS Manager
+                let bolusDouble = NSDecimalNumber(decimal: bolusAmount).doubleValue
+                await apsManager.enactBolus(amount: bolusDouble, isSMB: false) { success, message in
+                    // Acknowledge success or error of bolus
+                    self.sendAcknowledgment(
+                        toWatch: success,
+                        message: message,
+                        ackCode: success == true ? .genericSuccess : .genericFailure
+                    )
+                }
+                debug(.bolus, "Watch bolus of \(bolusDouble) U handed to APS manager")
+                // Notify Watch: "Carbs and bolus logged successfully"
+                sendAcknowledgment(
+                    toWatch: true,
+                    message: String(
+                        localized: "Carbs and Bolus logged successfully.",
+                        comment: "Successful message sent to watch when logging carbs and bolus"
+                    ),
+                    ackCode: .comboComplete
+                )
+
+            } catch let requestError {
+                error(.watch, "Logging carbs and bolus from watch failed", error: requestError)
+                sendAcknowledgment(toWatch: false, message: "Failed to log carbs and bolus", ackCode: .genericFailure)
+            }
+        }
+    }
+
+    private func handleCancelOverride() {
+        Task {
+            do {
+                let outcome = try await adjustmentManager.cancelOverride(source: .watch)
+                debug(.treatments, "Override \"\(outcome.ended.first?.name ?? "Custom Override")\" stopped from watch")
+
+                self.sendAcknowledgment(
+                    toWatch: true,
+                    message: String(
+                        localized: "Stopped Override successfully.",
+                        comment: "Stopped Override successfully"
+                    ),
+                    ackCode: .overrideStopped
+                )
+            } catch {
+                warning(.treatments, "Stopping override from watch failed", error: error)
+                self.sendAcknowledgment(
+                    toWatch: false,
+                    message: (error as? AdjustmentError)?.errorDescription ?? "Error stopping Override.",
+                    ackCode: .genericFailure
+                )
+            }
+        }
+    }
+
+    private func handleActivateOverride(_ presetName: String) {
+        Task {
+            do {
+                let outcome = try await adjustmentManager.activateOverride(.presetName(presetName), source: .watch)
+                debug(.treatments, "Override \(presetName) started from watch")
+                if let ended = outcome.ended.first {
+                    debug(.treatments, "Recorded run for replaced override \"\(ended.name ?? "Custom Override")\"")
+                }
+
+                self.sendAcknowledgment(
+                    toWatch: true,
+                    message: String(
+                        localized: "Started Override \"\(presetName)\" successfully.",
+                        comment: "Start override with override name"
+                    ),
+                    ackCode: .overrideStarted
+                )
+            } catch {
+                warning(.treatments, "Starting override from watch failed", error: error)
+                self.sendAcknowledgment(
+                    toWatch: false,
+                    message: (error as? AdjustmentError)?.errorDescription ?? "Error activating Override \"\(presetName)\".",
+                    ackCode: .genericFailure
+                )
+            }
+        }
+    }
+
+    private func handleActivateTempTarget(_ presetName: String) {
+        Task {
+            do {
+                let outcome = try await adjustmentManager.activateTempTarget(.presetName(presetName), source: .watch)
+                debug(.treatments, "Temp target \(presetName) started from watch")
+                if let ended = outcome.ended.first {
+                    debug(.treatments, "Recorded run for replaced temp target \"\(ended.name ?? "Temp Target")\"")
+                }
+
+                self.sendAcknowledgment(
+                    toWatch: true,
+                    message: String(
+                        localized: "Started Temp Target \"\(presetName)\" successfully.",
+                        comment: "Started Temp Target successfully."
+                    ),
+                    ackCode: .tempTargetStarted
+                )
+            } catch {
+                warning(.treatments, "Starting temp target from watch failed", error: error)
+                self.sendAcknowledgment(
+                    toWatch: false,
+                    message: (error as? AdjustmentError)?.errorDescription ?? "Error activating Temp Target \"\(presetName)\".",
+                    ackCode: .genericFailure
+                )
+            }
+        }
+    }
+
+    private func handleCancelTempTarget() {
+        Task {
+            do {
+                let outcome = try await adjustmentManager.cancelTempTarget(source: .watch)
+                debug(.treatments, "Temp target \"\(outcome.ended.first?.name ?? "Temp Target")\" stopped from watch")
+
+                self.sendAcknowledgment(
+                    toWatch: true,
+                    message: String(
+                        localized: "Stopped Temp Target successfully.",
+                        comment: "Stopped Temp Target successfully."
+                    ),
+                    ackCode: .tempTargetStopped
+                )
+            } catch {
+                warning(.treatments, "Stopping temp target from watch failed", error: error)
+                self.sendAcknowledgment(
+                    toWatch: false,
+                    message: (error as? AdjustmentError)?.errorDescription ?? "Error stopping Temp Target.",
+                    ackCode: .genericFailure
+                )
+            }
+        }
+    }
+}
+
+// TODO: - is there a better approach than setting up the watch state every time a setting has changed?
+extension BaseWatchManager: SettingsObserver, PumpSettingsObserver {
+    // to update maxBolus
+    func pumpSettingsDidChange(_: PumpSettings) {
+        scheduleWatchStatePush()
+    }
+
+    // to update the rest
+    func settingsDidChange(_: TrioSettings) {
+        units = settingsManager.settings.units
+        glucoseColorScheme = settingsManager.settings.glucoseColorScheme
+        lowGlucose = settingsManager.settings.low
+        highGlucose = settingsManager.settings.high
+
+        scheduleWatchStatePush()
+    }
+}
+
+extension BaseWatchManager: SnoozeObserver {
+    @MainActor func snoozeDidChange(_: Date) {
+        Task { await self.pushWatchState() }
+    }
+}
+
+extension BaseWatchManager {
+    /// Retrieves the current glucose target based on the time of day.
+    private func getCurrentGlucoseTarget() async -> Decimal? {
+        let now = Date()
+        let calendar = Calendar.current
+
+        let bgTargets = await fileStorage.retrieveAsync(OpenAPS.Settings.bgTargets, as: BGTargets.self)
+            ?? BGTargets(from: OpenAPS.defaults(for: OpenAPS.Settings.bgTargets))
+            ?? BGTargets(units: .mgdL, userPreferredUnits: .mgdL, targets: [])
+        let entries: [(start: String, value: Decimal)] = bgTargets.targets.map { ($0.start, $0.low) }
+
+        for (index, entry) in entries.enumerated() {
+            guard let entryTime = TherapySettingsUtil.parseTime(entry.start) else {
+                warning(.watch, "Skipped glucose target with invalid start time \(entry.start)")
+                continue
+            }
+
+            let entryComponents = calendar.dateComponents([.hour, .minute, .second], from: entryTime)
+            let entryStartTime = calendar.date(
+                bySettingHour: entryComponents.hour!,
+                minute: entryComponents.minute!,
+                second: entryComponents.second!,
+                of: now
+            )!
+
+            let entryEndTime: Date
+            if index < entries.count - 1,
+               let nextEntryTime = TherapySettingsUtil.parseTime(entries[index + 1].start)
+            {
+                let nextEntryComponents = calendar.dateComponents([.hour, .minute, .second], from: nextEntryTime)
+                entryEndTime = calendar.date(
+                    bySettingHour: nextEntryComponents.hour!,
+                    minute: nextEntryComponents.minute!,
+                    second: nextEntryComponents.second!,
+                    of: now
+                )!
+            } else {
+                entryEndTime = calendar.date(byAdding: .day, value: 1, to: entryStartTime)!
+            }
+
+            if now >= entryStartTime, now < entryEndTime {
+                return entry.value
+            }
+        }
+
+        return nil
+    }
+}
+
+extension BaseWatchManager {
+    enum AcknowledgmentCode: String, Codable {
+        case savingCarbs = "saving_carbs"
+        case enactingBolus = "enacting_bolus"
+        case comboComplete = "combo_complete"
+        case carbsLogged = "carbs_logged"
+        case overrideStarted = "override_started"
+        case overrideStopped = "override_stopped"
+        case tempTargetStarted = "temp_target_started"
+        case tempTargetStopped = "temp_target_stopped"
+        case genericSuccess = "success"
+        case genericFailure = "failure"
+    }
+}
+
+enum ComplicationTransferBudget {
+    private static let minimumInterval: TimeInterval = 10 * 60
+
+    static func isTransferDue(
+        at date: Date,
+        lastTransfer: Date,
+        remainingTransfers: Int,
+        calendar: Calendar = .current
+    ) -> Bool {
+        guard remainingTransfers > 0, let endOfDay = calendar.dateInterval(of: .day, for: date)?.end else { return false }
+        let spreadInterval = endOfDay.timeIntervalSince(date) / Double(remainingTransfers)
+        return date.timeIntervalSince(lastTransfer) >= max(spreadInterval, minimumInterval)
+    }
+}
